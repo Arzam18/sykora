@@ -12,7 +12,6 @@ Magic bitboards, alpha-beta with modern pruning and reductions, Lazy SMP, embedd
 [![Lichess bullet rating](https://lichess-shield.vercel.app/api?username=sykorabot&format=bullet)](https://lichess.org/@/sykorabot/perf/bullet)
 [![Lichess blitz rating](https://lichess-shield.vercel.app/api?username=sykorabot&format=blitz)](https://lichess.org/@/sykorabot/perf/blitz)
 [![Lichess rapid rating](https://lichess-shield.vercel.app/api?username=sykorabot&format=rapid)](https://lichess.org/@/sykorabot/perf/rapid)
-[![Release SPRT](https://github.com/sb2bg/sykora/actions/workflows/sprt.yml/badge.svg)](https://github.com/sb2bg/sykora/actions/workflows/sprt.yml)
 
 [Play live on Lichess →](https://lichess.org/@/sykorabot)
 
@@ -37,7 +36,8 @@ Sykora is tested on the CCRL [Blitz](https://computerchess.org.uk/404/) and [40/
 
 | Version               | CCRL Blitz        | CCRL 40/15 | Elo Improvement |
 | --------------------- | ----------------- | ---------- | --------------- |
-| `Sykora 4.0 64-bit`   | `3505`            | `3455`     | `+149`          |
+| `Sykora 4.1 64-bit`   | `3590`            | -          | `+76`           |
+| `Sykora 4.0 64-bit`   | `3505`            | `3458`     | `+149`          |
 | `Sykora 3.1 64-bit`   | -                 | `3306`     | `+42`           |
 | `Sykora 3.0 64-bit`   | `3264`            | -          | `+24`           |
 | `Sykora 0.2.2 64-bit` | `3240`            | `3234`     | -               |
@@ -157,10 +157,12 @@ Sykora is tested on the CCRL [Blitz](https://computerchess.org.uk/404/) and [40/
 | `Threads`         | int    | `1`       | Search threads (1..64, Lazy SMP)                           |
 | `Hash`            | int    | `128`     | Transposition table size in MB (1..4096)                   |
 | `Move Overhead`   | int    | `30`      | Clock reserve in milliseconds (0..5000)                    |
-| `LMRScale`        | int    | `134`     | Fixed-point LMR scale for OpenBench tuning (100 = 1.00)    |
-| `LMRHistoryScale` | int    | `95`      | Fixed-point LMR history influence (100 = 1.00)             |
-| `LMPMoveScale`    | int    | `96`      | Fixed-point LMP move-count scale (100 = 1.00)              |
-| `HistoryMaxBonus` | int    | `490`     | Maximum quiet/continuation history update                  |
+| `CheckExtension`  | int    | `2`       | Check extension mode (0=off, 1=all, 2=PV only)              |
+
+Search margins, reduction terms, and time-management factors are also exposed
+as spin options for OpenBench tuning. They are declared in
+[`src/search/tuning.zig`](src/search/tuning.zig); `sykora spsa [group...]`
+prints them as OpenBench SPSA input.
 
 The activation function (ReLU or SCReLU) is auto-detected from the network file header.
 
@@ -194,6 +196,14 @@ zig build -Doptimize=ReleaseFast
 ```
 
 The executable lands at `zig-out/bin/sykora`. The embedded NNUE net (`src/net.sknnue`) is compiled in.
+
+The release asset `sykora-linux-aarch64` is a static musl build with NEON and
+position-independent code for AArch64 Linux and Android. Build it locally with
+Zig 0.15.2 using:
+
+```bash
+zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl -Dcpu=baseline+neon -Dpie
+```
 
 Run directly, or via the build system:
 
@@ -273,8 +283,6 @@ python utils/history/history.py sts candidate --movetime-ms 100
 ```
 
 Every archived selfplay/SPRT run writes settings, summary JSON, stdout/stderr logs, and reproducibility metadata under `history/`.
-
-The `Release SPRT` workflow (`.github/workflows/sprt.yml`) uses the same archived `history.py sprt` path.
 
 Low-level runners under `utils/match/` remain available, but they are implementation details rather than the recommended user/agent entrypoints.
 

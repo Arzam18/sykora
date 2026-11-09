@@ -409,13 +409,20 @@ pub const Board = struct {
         const color = undo.mover_color;
         const opponent_color = if (color == .white) pieceInfo.Color.black else pieceInfo.Color.white;
 
-        self.board.clearSquare(to_sq);
-        self.board.setPieceAt(from_sq, color, undo.moved_piece);
+        // The undo record names every piece involved, so touch only the
+        // affected bitboards instead of clearing a square across all eight.
+        const color_idx: usize = @intFromEnum(color);
+        const from_mask = @as(u64, 1) << @intCast(from_sq);
+        const to_mask = @as(u64, 1) << @intCast(to_sq);
+        const final_piece = move.promotion() orelse undo.moved_piece;
+        self.board.color_sets[color_idx] ^= from_mask | to_mask;
+        self.board.kind_sets[@intFromEnum(final_piece)] &= ~to_mask;
+        self.board.kind_sets[@intFromEnum(undo.moved_piece)] |= from_mask;
 
         if (undo.castle_rook_from) |rook_from| {
-            const rook_to = undo.castle_rook_to.?;
-            self.board.clearSquare(rook_to);
-            self.board.setPieceAt(rook_from, color, .rook);
+            const rook_masks = (@as(u64, 1) << @intCast(rook_from)) | (@as(u64, 1) << @intCast(undo.castle_rook_to.?));
+            self.board.color_sets[color_idx] ^= rook_masks;
+            self.board.kind_sets[@intFromEnum(pieceInfo.Type.rook)] ^= rook_masks;
         }
 
         if (undo.captured_piece) |cp| {
@@ -904,12 +911,14 @@ pub const BitBoard = struct {
         if ((self.color_sets[@intFromEnum(color)] & color_mask) == 0)
             return null;
 
-        for (self.kind_sets, 0..) |kind_mask, i| {
-            if ((kind_mask & color_mask) != 0)
-                return @enumFromInt(i);
+        // An occupied square holds exactly one kind, so sum kind * bit without
+        // the mispredicted early exits of a search loop.
+        const shift: u6 = @intCast(index);
+        var kind: u64 = 0;
+        inline for (1..6) |i| {
+            kind += i * ((self.kind_sets[i] >> shift) & 1);
         }
-
-        return null;
+        return @enumFromInt(kind);
     }
 
     /// Check if there are any pawns of the given color adjacent to the specified square.

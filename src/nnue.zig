@@ -6,7 +6,8 @@ const board = @import("bitboard.zig");
 const Board = board.Board;
 const piece = @import("piece.zig");
 
-pub const EMBEDDED_NET = @embedFile("net.sknnue");
+pub const EMBEDDED_NET = @embedFile("embedded_net");
+const huge_pages = @import("huge_pages.zig");
 
 pub const PSQ_INPUT_SIZE: usize = 768; // 2 colors * 6 piece types * 64 squares
 pub const MAX_HIDDEN_SIZE: usize = 2048;
@@ -69,13 +70,13 @@ pub const Network = struct {
     l1_biases: []i32, // [O, D1]
     l1_weights_grouped: []i8, // [O, H/4, D1, 4]
     l2_biases: []i32, // [O, D2]
-    l2_weights: []i8, // [O, 2*D1, D2]
+    l2_weights: []i8, // [O, 2*D1/4, D2, 4], regrouped at load from [O, 2*D1, D2]
     output_biases: []i32, // [O]
     output_weights: []i8, // [O, D2]
     p3_pawn_weights: []i8, // [128, R]
     p3_context_weights: []i8, // [640, R]
     p3_l1_weights_grouped: []i8, // [O, 4R/4, D1, 4]
-    p3_l1_corrections: [8 * 16]i32, // -128 * sum(weights), [O, D1]
+    p3_l1_corrections: [8 * 16]i32, // -128 * sum(weights) for unsigned dot inputs, [O, D1]
 
     pub fn deinit(self: *Network) void {
         self.allocator.free(self.ft_biases);
@@ -136,6 +137,7 @@ fn allocAndReadInts(
 ) LoadError![]T {
     const values = allocator.alloc(T, len) catch return error.OutOfMemory;
     errdefer allocator.free(values);
+    huge_pages.advise(std.mem.sliceAsBytes(values));
 
     for (values) |*value| {
         value.* = readBytesInt(T, data, pos) orelse return error.InvalidNetwork;
@@ -571,6 +573,22 @@ fn loadNetworkFromBytes(allocator: std.mem.Allocator, data: []const u8) LoadErro
     errdefer allocator.free(l2_biases);
     const l2_weights = try allocSectionInts(i8, allocator, data, l2_weight_section);
     errdefer allocator.free(l2_weights);
+    {
+        // Group four inputs per output so L2 runs on packed dot products.
+        const ungrouped = allocator.dupe(i8, l2_weights) catch return error.OutOfMemory;
+        defer allocator.free(ungrouped);
+        for (0..8) |bucket| {
+            for (0..8) |group| {
+                for (0..32) |output| {
+                    for (0..4) |lane| {
+                        const input = group * 4 + lane;
+                        l2_weights[((bucket * 8 + group) * 32 + output) * 4 + lane] =
+                            ungrouped[(bucket * 32 + input) * 32 + output];
+                    }
+                }
+            }
+        }
+    }
     const output_biases = try allocSectionInts(i32, allocator, data, output_bias_section);
     errdefer allocator.free(output_biases);
     const output_weights = try allocSectionInts(i8, allocator, data, output_weight_section);
@@ -625,7 +643,7 @@ fn loadNetworkFromBytes(allocator: std.mem.Allocator, data: []const u8) LoadErro
                         weight_sum += weight;
                     }
                 }
-                p3_corrections[bucket * 16 + output] = -128 * weight_sum;
+                p3_corrections[bucket * 16 + output] = if (nnue_dot.signed_inputs) 0 else -128 * weight_sum;
             }
         }
     }
@@ -1056,66 +1074,6 @@ inline fn applyFeatureSlice(comptime add: bool, dest: anytype, weights: []const 
     }
 }
 
-inline fn applyThreatFeatureBatch(
-    net: *const Network,
-    destination: anytype,
-    additions: []const u16,
-    removals: []const u16,
-) void {
-    std.debug.assert(additions.len <= 2);
-    std.debug.assert(removals.len <= 2);
-    const hidden_size = destination.len;
-    const threat_weights = net.threat_weights;
-    const DestVec = AccVecOf(@TypeOf(destination));
-    const Dest = std.meta.Elem(@TypeOf(destination));
-    var h: usize = 0;
-    while (h + SIMD_LANES <= hidden_size) : (h += SIMD_LANES) {
-        const destination_ptr: *align(1) DestVec = @ptrCast(&destination[h]);
-        var values = destination_ptr.*;
-        for (additions) |feature| {
-            const base = @as(usize, feature) * hidden_size + h;
-            const weight_ptr: *align(1) const ThreatWeightVec = @ptrCast(&threat_weights[base]);
-            values += @as(DestVec, @intCast(weight_ptr.*));
-        }
-        for (removals) |feature| {
-            const base = @as(usize, feature) * hidden_size + h;
-            const weight_ptr: *align(1) const ThreatWeightVec = @ptrCast(&threat_weights[base]);
-            values -= @as(DestVec, @intCast(weight_ptr.*));
-        }
-        destination_ptr.* = values;
-    }
-    while (h < hidden_size) : (h += 1) {
-        for (additions) |feature| {
-            destination[h] += @as(Dest, threat_weights[@as(usize, feature) * hidden_size + h]);
-        }
-        for (removals) |feature| {
-            destination[h] -= @as(Dest, threat_weights[@as(usize, feature) * hidden_size + h]);
-        }
-    }
-}
-
-fn applyThreatFeatureChanges(
-    net: *const Network,
-    destination: anytype,
-    additions: []const u16,
-    removals: []const u16,
-) void {
-    var addition_index: usize = 0;
-    var removal_index: usize = 0;
-    while (addition_index < additions.len or removal_index < removals.len) {
-        const addition_end = @min(addition_index + 2, additions.len);
-        const removal_end = @min(removal_index + 2, removals.len);
-        applyThreatFeatureBatch(
-            net,
-            destination,
-            additions[addition_index..addition_end],
-            removals[removal_index..removal_end],
-        );
-        addition_index = addition_end;
-        removal_index = removal_end;
-    }
-}
-
 fn applyThreatFeatureChangesFromPrev(
     net: *const Network,
     destination: []i16,
@@ -1200,12 +1158,70 @@ fn applyThreatFeatureChangesFromPrev(
     }
 }
 
+/// dest = prev + sum(adds) - sum(subs) for i16 accumulators. Row counts are
+/// compile-time so each tile of eight vectors is fully unrolled: LLVM leaves
+/// the equivalent one-vector loop rolled, which is several times slower.
+inline fn applyRowsTiled(
+    comptime add_count: usize,
+    comptime sub_count: usize,
+    dest: []i16,
+    prev: []const i16,
+    adds: [add_count][]const i16,
+    subs: [sub_count][]const i16,
+) void {
+    var offset: usize = 0;
+    while (offset + 8 * SIMD_LANES <= dest.len) : (offset += 8 * SIMD_LANES) {
+        applyRowsTile(8, add_count, sub_count, dest, prev, adds, subs, offset);
+    }
+    while (offset + SIMD_LANES <= dest.len) : (offset += SIMD_LANES) {
+        applyRowsTile(1, add_count, sub_count, dest, prev, adds, subs, offset);
+    }
+    while (offset < dest.len) : (offset += 1) {
+        var value = prev[offset];
+        inline for (adds) |row| value +%= row[offset];
+        inline for (subs) |row| value -%= row[offset];
+        dest[offset] = value;
+    }
+}
+
+inline fn applyRowsTile(
+    comptime registers: usize,
+    comptime add_count: usize,
+    comptime sub_count: usize,
+    dest: []i16,
+    prev: []const i16,
+    adds: [add_count][]const i16,
+    subs: [sub_count][]const i16,
+    offset: usize,
+) void {
+    var accumulators: [registers]WeightVec = undefined;
+    inline for (0..registers) |register| {
+        accumulators[register] = @as(*align(1) const WeightVec, @ptrCast(&prev[offset + register * SIMD_LANES])).*;
+    }
+    inline for (adds) |row| {
+        inline for (0..registers) |register| {
+            accumulators[register] +%= @as(*align(1) const WeightVec, @ptrCast(&row[offset + register * SIMD_LANES])).*;
+        }
+    }
+    inline for (subs) |row| {
+        inline for (0..registers) |register| {
+            accumulators[register] -%= @as(*align(1) const WeightVec, @ptrCast(&row[offset + register * SIMD_LANES])).*;
+        }
+    }
+    inline for (0..registers) |register| {
+        @as(*align(1) WeightVec, @ptrCast(&dest[offset + register * SIMD_LANES])).* = accumulators[register];
+    }
+}
+
 inline fn applyFeatureSlicesFromPrevAddSub(
     dest: anytype,
     prev: anytype,
     add_weights: []const i16,
     sub_weights: []const i16,
 ) void {
+    if (comptime std.meta.Elem(@TypeOf(dest)) == i16) {
+        return applyRowsTiled(1, 1, dest, prev, .{add_weights}, .{sub_weights});
+    }
     const AccVec = AccVecOf(@TypeOf(dest));
     var h: usize = 0;
     while (h + SIMD_LANES <= dest.len) : (h += SIMD_LANES) {
@@ -1228,6 +1244,9 @@ inline fn applyFeatureSlicesFromPrevAddSubSub(
     sub_a_weights: []const i16,
     sub_b_weights: []const i16,
 ) void {
+    if (comptime std.meta.Elem(@TypeOf(dest)) == i16) {
+        return applyRowsTiled(1, 2, dest, prev, .{add_weights}, .{ sub_a_weights, sub_b_weights });
+    }
     const AccVec = AccVecOf(@TypeOf(dest));
     var h: usize = 0;
     while (h + SIMD_LANES <= dest.len) : (h += SIMD_LANES) {
@@ -1252,6 +1271,9 @@ inline fn applyFeatureSlicesFromPrevAddAddSubSub(
     sub_a_weights: []const i16,
     sub_b_weights: []const i16,
 ) void {
+    if (comptime std.meta.Elem(@TypeOf(dest)) == i16) {
+        return applyRowsTiled(2, 2, dest, prev, .{ add_a_weights, add_b_weights }, .{ sub_a_weights, sub_b_weights });
+    }
     const AccVec = AccVecOf(@TypeOf(dest));
     var h: usize = 0;
     while (h + SIMD_LANES <= dest.len) : (h += SIMD_LANES) {
@@ -1758,7 +1780,11 @@ fn refreshPerspectiveAccumulatorCached(
         return;
     }
 
-    @memcpy(dest, entry.values[0..hidden_size]);
+    // At most 32 pieces leave and 32 arrive, so one pass applies them all.
+    var adds: [32][]const i16 = undefined;
+    var subs: [32][]const i16 = undefined;
+    var add_count: usize = 0;
+    var sub_count: usize = 0;
     inline for ([_]piece.Color{ .white, .black }) |color| {
         const color_idx: usize = @intFromEnum(color);
         const old_color_bb = entry.color_sets[color_idx];
@@ -1773,25 +1799,20 @@ fn refreshPerspectiveAccumulatorCached(
             while (removed != 0) {
                 const sq: u8 = @intCast(@ctz(removed));
                 removed &= removed - 1;
-                applyFeatureSlice(
-                    false,
-                    dest,
-                    perspectiveFeatureWeights(net, perspective, king_sq, sq, pt, color, hidden_size),
-                );
+                subs[sub_count] = perspectiveFeatureWeights(net, perspective, king_sq, sq, pt, color, hidden_size);
+                sub_count += 1;
             }
 
             var added = new_set & ~old_set;
             while (added != 0) {
                 const sq: u8 = @intCast(@ctz(added));
                 added &= added - 1;
-                applyFeatureSlice(
-                    true,
-                    dest,
-                    perspectiveFeatureWeights(net, perspective, king_sq, sq, pt, color, hidden_size),
-                );
+                adds[add_count] = perspectiveFeatureWeights(net, perspective, king_sq, sq, pt, color, hidden_size);
+                add_count += 1;
             }
         }
     }
+    applyFeatureRowsFromPrev(dest, entry.values[0..hidden_size], adds[0..add_count], subs[0..sub_count]);
 
     saveRefreshCachePosition(entry, b, dest);
 }
@@ -2086,6 +2107,146 @@ pub fn updateAccumulators(
     }
 }
 
+/// Most rows two consecutive moves can add or remove for one perspective:
+/// castling (two each way) followed by a capture-promotion (one add, two subs).
+const MAX_TWO_MOVE_ROWS = 4;
+
+const FeatureRows = struct {
+    adds: [MAX_TWO_MOVE_ROWS][]const i16 = undefined,
+    subs: [MAX_TWO_MOVE_ROWS][]const i16 = undefined,
+    add_count: usize = 0,
+    sub_count: usize = 0,
+
+    inline fn add(self: *FeatureRows, row: []const i16) void {
+        // A row removed earlier and added back cancels out.
+        for (self.subs[0..self.sub_count], 0..) |removed, i| {
+            if (removed.ptr == row.ptr) {
+                self.sub_count -= 1;
+                self.subs[i] = self.subs[self.sub_count];
+                return;
+            }
+        }
+        self.adds[self.add_count] = row;
+        self.add_count += 1;
+    }
+
+    inline fn sub(self: *FeatureRows, row: []const i16) void {
+        for (self.adds[0..self.add_count], 0..) |added, i| {
+            if (added.ptr == row.ptr) {
+                self.add_count -= 1;
+                self.adds[i] = self.adds[self.add_count];
+                return;
+            }
+        }
+        self.subs[self.sub_count] = row;
+        self.sub_count += 1;
+    }
+};
+
+inline fn moveRefreshesPerspective(net: *const Network, perspective: piece.Color, update: anytype) bool {
+    return update.moved_piece == .king and update.moved_color == perspective and
+        perspectiveLayoutChanged(net, perspective, update.from_sq, update.to_sq);
+}
+
+inline fn appendMoveRows(
+    net: *const Network,
+    perspective: piece.Color,
+    king_sq: u8,
+    update: anytype,
+    rows: *FeatureRows,
+    hidden_size: usize,
+) void {
+    const color = update.moved_color;
+    rows.sub(perspectiveFeatureWeights(net, perspective, king_sq, update.from_sq, update.moved_piece, color, hidden_size));
+    rows.add(perspectiveFeatureWeights(net, perspective, king_sq, update.to_sq, update.promotion orelse update.moved_piece, color, hidden_size));
+    if (update.captured_piece) |captured| {
+        rows.sub(perspectiveFeatureWeights(net, perspective, king_sq, update.capture_sq.?, captured, oppositeColor(color), hidden_size));
+    }
+    if (update.rook_from) |rook_from| {
+        rows.sub(perspectiveFeatureWeights(net, perspective, king_sq, rook_from, .rook, color, hidden_size));
+        rows.add(perspectiveFeatureWeights(net, perspective, king_sq, update.rook_to.?, .rook, color, hidden_size));
+    }
+}
+
+/// dest = prev + sum(adds) - sum(subs) for runtime row counts, accumulated
+/// tile by tile in registers.
+fn applyFeatureRowsFromPrev(dest: []i16, prev: []const i16, adds: []const []const i16, subs: []const []const i16) void {
+    std.debug.assert(dest.len == prev.len);
+    std.debug.assert(dest.len % SIMD_LANES == 0);
+    var offset: usize = 0;
+    while (offset + 8 * SIMD_LANES <= dest.len) : (offset += 8 * SIMD_LANES) {
+        applyFeatureRowsTile(8, dest, prev, adds, subs, offset);
+    }
+    while (offset < dest.len) : (offset += SIMD_LANES) {
+        applyFeatureRowsTile(1, dest, prev, adds, subs, offset);
+    }
+}
+
+inline fn applyFeatureRowsTile(
+    comptime registers: usize,
+    dest: []i16,
+    prev: []const i16,
+    adds: []const []const i16,
+    subs: []const []const i16,
+    offset: usize,
+) void {
+    var accumulators: [registers]WeightVec = undefined;
+    inline for (0..registers) |register| {
+        accumulators[register] = @as(*align(1) const WeightVec, @ptrCast(&prev[offset + register * SIMD_LANES])).*;
+    }
+    for (adds) |row| {
+        inline for (0..registers) |register| {
+            accumulators[register] +%= @as(*align(1) const WeightVec, @ptrCast(&row[offset + register * SIMD_LANES])).*;
+        }
+    }
+    for (subs) |row| {
+        inline for (0..registers) |register| {
+            accumulators[register] -%= @as(*align(1) const WeightVec, @ptrCast(&row[offset + register * SIMD_LANES])).*;
+        }
+    }
+    inline for (0..registers) |register| {
+        @as(*align(1) WeightVec, @ptrCast(&dest[offset + register * SIMD_LANES])).* = accumulators[register];
+    }
+}
+
+/// Apply two consecutive moves to the PSQ accumulators of the position two
+/// plies back, skipping the intermediate accumulator entirely. A perspective
+/// whose king layout changed during either move is refreshed from the
+/// current board instead. Integer wrap-around makes the result identical to
+/// two single-move updates for any net that passes the load-time bound check.
+pub fn updateAccumulatorsTwoMoves(
+    net: *const Network,
+    b: *Board,
+    prev: *const AccumulatorPair,
+    result: *AccumulatorPair,
+    first: anytype,
+    second: anytype,
+    refresh_cache: ?*AccumulatorRefreshCache,
+) void {
+    const hidden_size: usize = @intCast(net.ft_hidden_size);
+    inline for ([_]piece.Color{ .white, .black }) |perspective| {
+        const dest = result.slice(perspective, hidden_size);
+        if (moveRefreshesPerspective(net, perspective, first) or moveRefreshesPerspective(net, perspective, second)) {
+            if (refresh_cache) |cache| {
+                refreshPerspectiveAccumulatorCached(net, b, perspective, dest, cache);
+            } else {
+                initPerspectiveAccumulator(net, b, perspective, dest);
+            }
+        } else {
+            const king_sq = perspectiveKingSquareOnBoard(b, perspective);
+            var rows = FeatureRows{};
+            appendMoveRows(net, perspective, king_sq, first, &rows, hidden_size);
+            appendMoveRows(net, perspective, king_sq, second, &rows, hidden_size);
+            applyFeatureRowsFromPrev(
+                dest,
+                prev.sliceConst(perspective, hidden_size),
+                rows.adds[0..rows.add_count],
+                rows.subs[0..rows.sub_count],
+            );
+        }
+    }
+}
+
 inline fn outputBucket(net: *const Network, b: *Board) usize {
     std.debug.assert(net.output_bucket_count == 8);
     const piece_count = @popCount(b.board.occupied()); // includes kings, 2..32
@@ -2201,14 +2362,21 @@ fn finishPairwiseMlpTail16x32(
         }
     }
 
-    const l2_bias_ptr: *align(1) const Dense2Vec = @ptrCast(&l2_biases[bucket * 32]);
-    var l2_sums = l2_bias_ptr.*;
-    for (0..32) |input| {
-        const weight_index = (bucket * 32 + input) * 32;
-        const weight_ptr: *align(1) const Dense2WeightVec = @ptrCast(&l2_weights[weight_index]);
-        const input_vec: Dense2Vec = @splat(dense1_activated[input]);
-        l2_sums += input_vec * @as(Dense2Vec, @intCast(weight_ptr.*));
+    // Activations lie in [0, q] with q = 64, so they fit the packed-byte
+    // dot products used by L1; i32 sums make the result exact.
+    var dense1_bytes: [32]u8 = undefined;
+    for (&dense1_bytes, dense1_activated) |*byte, value| byte.* = @intCast(value);
+    var l2_array: [32]i32 = l2_biases[bucket * 32 ..][0..32].*;
+    inline for (0..8) |group| {
+        const inputs = nnue_dot.splatGroup(dense1_bytes[group * 4 ..][0..4]);
+        inline for (0..32 / nnue_dot.output_lanes) |chunk| {
+            const output = chunk * nnue_dot.output_lanes;
+            const weights: *align(1) const nnue_dot.I8Vec = @ptrCast(&l2_weights[((bucket * 8 + group) * 32 + output) * 4]);
+            const sums: *align(1) nnue_dot.I32Vec = @ptrCast(&l2_array[output]);
+            sums.* = nnue_dot.dotAdd(sums.*, inputs, weights.*);
+        }
     }
+    const l2_sums: Dense2Vec = l2_array;
 
     var dense2_activated: Dense2Vec = undefined;
     inline for (0..8) |block| {
@@ -2271,7 +2439,11 @@ inline fn fillP3FeatureBlock(
     const rounded = (raw + half - @select(i32, raw < zero, one, zero)) >>
         @as(P3U5Vec, @splat(P3_ACTIVATION_SHIFT));
     const clipped = @min(@max(rounded, @as(P3I32Vec, @splat(-128))), @as(P3I32Vec, @splat(127)));
-    destination.* = @intCast(clipped + @as(P3I32Vec, @splat(128)));
+    if (comptime nnue_dot.signed_inputs) {
+        destination.* = @bitCast(@as(@Vector(P3_SIMD_LANES, i8), @intCast(clipped)));
+    } else {
+        destination.* = @intCast(clipped + @as(P3I32Vec, @splat(128)));
+    }
 }
 
 fn fillP3Features(
@@ -2327,6 +2499,12 @@ fn addP3L1Contribution(
     }
 }
 
+/// High half of the signed 16x16 product; lowers to pmulhw / smull+shrn.
+inline fn mulHigh16(a: WeightVec, b: WeightVec) WeightVec {
+    const product = @as(I32Vec, a) * @as(I32Vec, b);
+    return @intCast(product >> @splat(16));
+}
+
 inline fn poolSplitAccumulatorBlock(
     net: *const Network,
     psq: anytype,
@@ -2339,6 +2517,18 @@ inline fn poolSplitAccumulatorBlock(
     const psq_b: *align(1) const PsqVec = @ptrCast(&psq[offset + half]);
     const threat_a: *align(1) const WeightVec = @ptrCast(&threat[offset]);
     const threat_b: *align(1) const WeightVec = @ptrCast(&threat[offset + half]);
+    if (comptime PsqVec == WeightVec) {
+        // Stay in i16 lanes. Saturation cannot change the result because the
+        // sum is clipped to [0, Q0] next, and with Q0 = 255 (enforced at load)
+        // a << 7 still fits i16, so mulhi(a << 7, b) == (a * b) >> 9 exactly.
+        comptime std.debug.assert((Q0 << 7) <= std.math.maxInt(i16));
+        const zero: WeightVec = @splat(0);
+        const max_vec: WeightVec = @splat(Q0);
+        // Explicit types: @min against a comptime bound would narrow to u8.
+        const a: WeightVec = @min(@max(psq_a.* +| threat_a.*, zero), max_vec);
+        const b: WeightVec = @min(@max(psq_b.* +| threat_b.*, zero), max_vec);
+        return @intCast(mulHigh16(a << @splat(7), b));
+    }
     const a = clampVecToActivationRange(
         @as(I32Vec, @intCast(psq_a.*)) + @as(I32Vec, @intCast(threat_a.*)),
         net.q0,
@@ -2350,6 +2540,8 @@ inline fn poolSplitAccumulatorBlock(
     const divisor: I32Vec = @splat(512);
     return @intCast(@divTrunc(a * b, divisor));
 }
+
+const L1_ACCUMULATORS = 4;
 
 fn evaluatePairwiseMlpTail16x32FromSplit(
     net: *const Network,
@@ -2367,7 +2559,9 @@ fn evaluatePairwiseMlpTail16x32FromSplit(
     std.debug.assert(SIMD_LANES % 4 == 0);
     const bucket = outputBucket(net, b);
     const l1_bias_ptr: *align(1) const Dense1Vec = @ptrCast(&net.l1_biases[bucket * 16]);
-    var l1_sums = l1_bias_ptr.*;
+    // Independent partial sums break the dot-product dependency chain;
+    // integer addition makes the final reduction order irrelevant.
+    var partial_sums = [_]Dense1Vec{@splat(0)} ** L1_ACCUMULATORS;
 
     var offset: usize = 0;
     while (offset < half) : (offset += SIMD_LANES) {
@@ -2392,17 +2586,19 @@ fn evaluatePairwiseMlpTail16x32FromSplit(
                 bucket,
                 (offset + lane) / 4,
                 @ptrCast(&us_pooled[lane]),
-                &l1_sums,
+                &partial_sums[(2 * group_in_block) % L1_ACCUMULATORS],
             );
             accumulatePairwiseL1Group(
                 net,
                 bucket,
                 (half + offset + lane) / 4,
                 @ptrCast(&them_pooled[lane]),
-                &l1_sums,
+                &partial_sums[(2 * group_in_block + 1) % L1_ACCUMULATORS],
             );
         }
     }
+    var l1_sums = l1_bias_ptr.*;
+    for (partial_sums) |partial| l1_sums += partial;
     if (net.is_p3) {
         addP3L1Contribution(
             net,
@@ -2448,6 +2644,8 @@ fn evaluatePairwiseMlpFromSplitSlices(
     );
 }
 
+const zero_threat_values = [_]i16{0} ** MAX_HIDDEN_SIZE;
+
 /// Full initialization of the V8 threat sums at a search root.
 pub fn initThreatAccumulators(net: *const Network, b: *Board) ThreatAccumulatorPair {
     var result = ThreatAccumulatorPair{
@@ -2470,8 +2668,8 @@ pub fn initThreatAccumulators(net: *const Network, b: *Board) ThreatAccumulatorP
     );
 
     const hidden_size: usize = @intCast(net.ft_hidden_size);
-    applyThreatFeatureChanges(net, result.white.values[0..hidden_size], features.white, &.{});
-    applyThreatFeatureChanges(net, result.black.values[0..hidden_size], features.black, &.{});
+    applyThreatFeatureChangesFromPrev(net, result.white.values[0..hidden_size], zero_threat_values[0..hidden_size], features.white, &.{});
+    applyThreatFeatureChangesFromPrev(net, result.black.values[0..hidden_size], zero_threat_values[0..hidden_size], features.black, &.{});
     return result;
 }
 
@@ -2482,10 +2680,10 @@ fn refreshThreatAccumulator(
     result: *ThreatAccumulator,
 ) void {
     const hidden_size: usize = @intCast(net.ft_hidden_size);
-    @memset(result.values[0..hidden_size], 0);
     var feature_storage: [full_threats_v1.max_active]u16 = undefined;
     const features = full_threats_v1.enumerate(&b.board, perspective, &feature_storage);
-    applyThreatFeatureChanges(net, result.values[0..hidden_size], features, &.{});
+    // One tiled pass over all active rows instead of a pass per pair of rows.
+    applyThreatFeatureChangesFromPrev(net, result.values[0..hidden_size], zero_threat_values[0..hidden_size], features, &.{});
 }
 
 fn updateThreatAccumulator(

@@ -11,11 +11,13 @@ const nnue = @import("nnue.zig");
 const move_picker_mod = @import("search/move_picker.zig");
 const tt_mod = @import("search/tt.zig");
 const heuristics = @import("search/heuristics.zig");
+const tuning_mod = @import("search/tuning.zig");
 
 const KillerMoves = heuristics.KillerMoves;
 const CounterMoveTable = heuristics.CounterMoveTable;
 const HistoryTable = heuristics.HistoryTable;
 const ContinuationHistoryTable = heuristics.ContinuationHistoryTable;
+const CorrectionHistory = heuristics.CorrectionHistory;
 const continuationKey = heuristics.continuationKey;
 const INVALID_CONTINUATION_KEY = heuristics.INVALID_CONTINUATION_KEY;
 
@@ -75,26 +77,17 @@ pub const SearchResult = struct {
     depth: u32,
 };
 
-/// Smooth search-shape controls exposed through UCI for OpenBench tuning.
-/// Percentage fields are fixed-point integers where 100 represents 1.00.
-/// Defaults track the latest accepted SPSA candidate.
-pub const SearchTuning = struct {
-    lmr_scale_pct: i32 = 140,
-    lmr_history_scale_pct: i32 = 95,
-    lmr_full_depth_moves: u32 = 3,
-    lmp_move_scale_pct: i32 = 90,
-    history_max_bonus: u32 = 490,
-    /// 0 disables check extensions, 1 extends every checked node, and 2 only
-    /// extends checked PV nodes.
-    check_extension_mode: u32 = 2,
-};
+pub const SearchTuning = tuning_mod.SearchTuning;
 
-const MAX_PLY = 64;
+const MAX_PLY = heuristics.MAX_PLY;
 const MAX_KILLER_MOVES = 2;
 const ROOT_MOVE_BUCKETS = 64 * 64;
 const STATIC_EVAL_STACK_SIZE = MAX_PLY;
 const EVAL_CACHE_SIZE = 262144; // Must be power-of-two for fast masking.
-const EVAL_CACHE_EMPTY_KEY = std.math.maxInt(u64);
+const EVAL_CACHE_EMPTY_KEY = std.math.maxInt(u32);
+/// Key and value share one 8-byte slot so a probe costs one miss, not two.
+/// The index supplies the low hash bits; `key` holds the high 32.
+const EvalCacheEntry = extern struct { key: u32, value: i32 };
 const SEE_CAPTURE_SCALE: i32 = 128;
 
 const INF: i32 = 32000;
@@ -183,6 +176,7 @@ fn adaptiveSoftLimit(
     iteration_nodes: usize,
     best_move_stability: u32,
     score_delta: ?u32,
+    tuning: *const SearchTuning,
 ) u64 {
     if (depth < 5 or iteration_nodes == 0) return budget.soft_ms;
 
@@ -190,9 +184,13 @@ fn adaptiveSoftLimit(
         (@as(u128, best_move_nodes) * 1000) / @as(u128, iteration_nodes),
         1000,
     ));
-    const node_factor = std.math.clamp(((1480 - node_share) * 1680) / 1000, 500, 2000);
+    const node_base: u64 = @intCast(tuning.tm_node_base);
+    const node_scale: u64 = @intCast(tuning.tm_node_scale);
+    const node_factor = std.math.clamp(((node_base - node_share) * node_scale) / 1000, 500, 2000);
     const stable_plies = @min(best_move_stability, 14);
-    const stability_factor = @max(@as(u64, 700), 1100 - @as(u64, stable_plies) * 30);
+    const stability_base: u64 = @intCast(tuning.tm_stability_base);
+    const stability_step: u64 = @intCast(tuning.tm_stability_step);
+    const stability_factor = @max(@as(u64, 700), stability_base -| @as(u64, stable_plies) * stability_step);
 
     var factor = (node_factor * stability_factor) / 1000;
     if (score_delta) |delta| {
@@ -259,8 +257,8 @@ inline fn speculativeSacPenalty(see_score: i32, depth: u32) i32 {
 
 // Pre-computed fixed-point LMR table. Keeping two decimal places lets the
 // runtime scale option make useful sub-integer changes before final rounding.
-const LMR_MIN_DEPTH: u32 = 3;
 const LMR_TABLE_MAX_DEPTH = 64;
+const LMR_GRAIN = 1024;
 const LMR_TABLE_MAX_MOVES = 64;
 const lmr_table_x100: [LMR_TABLE_MAX_DEPTH][LMR_TABLE_MAX_MOVES]i32 = blk: {
     @setEvalBranchQuota(10000);
@@ -280,36 +278,11 @@ const lmr_table_x100: [LMR_TABLE_MAX_DEPTH][LMR_TABLE_MAX_MOVES]i32 = blk: {
     break :blk table;
 };
 
-const LMP_MAX_DEPTH: u32 = 3;
-const LMP_IMPROVING_BONUS: u32 = 2;
-
-const NULL_MOVE_MIN_DEPTH: u32 = 3;
-const NULL_MOVE_REDUCTION: u32 = 3;
 const NULL_MOVE_DEEP_DEPTH: u32 = 6;
 const NULL_MOVE_VERIFICATION_DEPTH: u32 = 8;
-const NULL_MOVE_STATIC_EVAL_MARGIN: i32 = 80;
-const PROBCUT_MIN_DEPTH: u32 = 6;
 const PROBCUT_REDUCTION: u32 = 4;
-const PROBCUT_MARGIN_CP: i32 = 200;
-const SINGULAR_MIN_DEPTH: u32 = 8;
 const SINGULAR_REDUCTION: u32 = 2;
-const SINGULAR_MARGIN_BASE_CP: i32 = 30;
-const SINGULAR_MARGIN_PER_PLY_CP: i32 = 25;
 const SINGULAR_MULTICUT_MIN_BEATERS: u32 = 2;
-
-// Futility pruning parameters
-const FUTILITY_MARGIN: i32 = 200;
-const FUTILITY_MARGIN_MULTIPLIER: i32 = 120;
-
-// Reverse futility pruning parameters
-const REVERSE_FUTILITY_MARGIN_PER_PLY: i32 = 100;
-// Razoring parameters
-const RAZOR_MARGIN: i32 = 500;
-const QS_SEE_PRUNE_MARGIN_CP: i32 = -80;
-const MAIN_SEE_PRUNE_MAX_DEPTH: u32 = 4;
-const MAIN_SEE_PRUNE_MARGIN_PER_PLY_CP: i32 = 70;
-const QUIET_SEE_PRUNE_MAX_DEPTH: u32 = 7;
-const QUIET_SEE_PRUNE_MARGIN_PER_PLY_CP: i32 = 20;
 
 pub const SearchEngine = struct {
     const Self = @This();
@@ -330,6 +303,8 @@ pub const SearchEngine = struct {
 
     const StaticEvalContext = struct {
         static_eval: i32,
+        raw_eval: i32,
+        correction_keys: CorrectionHistory.Keys,
         improving: bool,
         futile: bool,
     };
@@ -360,6 +335,7 @@ pub const SearchEngine = struct {
     history: HistoryTable,
     counter_moves: CounterMoveTable,
     continuation_history: *ContinuationHistoryTable,
+    correction_history: *CorrectionHistory,
     nodes_searched: usize,
     seldepth: u32,
     previous_move: ?Move,
@@ -367,6 +343,7 @@ pub const SearchEngine = struct {
     // Position history for repetition detection during search
     position_history: [512]u64,
     history_count: usize,
+    repetition_floor: usize,
     // Game history (positions before search started) - for proper repetition detection
     game_history: [512]u64,
     game_history_count: usize,
@@ -385,9 +362,10 @@ pub const SearchEngine = struct {
     acc_refresh_cache: ?*nnue.AccumulatorRefreshCache,
     acc_ply: u32,
     acc_valid: [128]bool,
+    /// Children pushed from each ply since that ply was entered.
+    acc_children: [128]u16,
     acc_updates: [128]AccumulatorUpdate,
-    eval_cache_keys: [EVAL_CACHE_SIZE]u64,
-    eval_cache_values: [EVAL_CACHE_SIZE]i32,
+    eval_cache: [EVAL_CACHE_SIZE]EvalCacheEntry,
     static_eval_stack: [STATIC_EVAL_STACK_SIZE]i32,
     search_start: std.time.Instant,
     hard_deadline_ns: ?u64,
@@ -408,6 +386,9 @@ pub const SearchEngine = struct {
         const continuation_history = try allocator.create(ContinuationHistoryTable);
         errdefer allocator.destroy(continuation_history);
         continuation_history.initInPlace();
+        const correction_history = try allocator.create(CorrectionHistory);
+        errdefer allocator.destroy(correction_history);
+        correction_history.initInPlace();
 
         return Self{
             .board = board_ptr,
@@ -422,12 +403,14 @@ pub const SearchEngine = struct {
             .history = HistoryTable.init(),
             .counter_moves = CounterMoveTable.init(),
             .continuation_history = continuation_history,
+            .correction_history = correction_history,
             .nodes_searched = 0,
             .seldepth = 0,
             .previous_move = null,
             .continuation_keys = [_]u16{INVALID_CONTINUATION_KEY} ** MAX_PLY,
             .position_history = undefined,
             .history_count = 0,
+            .repetition_floor = 0,
             .game_history = undefined,
             .game_history_count = 0,
             .use_nnue = use_nnue,
@@ -444,9 +427,9 @@ pub const SearchEngine = struct {
             .acc_refresh_cache = null,
             .acc_ply = 0,
             .acc_valid = [_]bool{false} ** 128,
+            .acc_children = [_]u16{0} ** 128,
             .acc_updates = undefined,
-            .eval_cache_keys = [_]u64{EVAL_CACHE_EMPTY_KEY} ** EVAL_CACHE_SIZE,
-            .eval_cache_values = [_]i32{0} ** EVAL_CACHE_SIZE,
+            .eval_cache = [_]EvalCacheEntry{.{ .key = EVAL_CACHE_EMPTY_KEY, .value = 0 }} ** EVAL_CACHE_SIZE,
             .static_eval_stack = [_]i32{-INF} ** STATIC_EVAL_STACK_SIZE,
             .search_start = std.time.Instant.now() catch unreachable,
             .hard_deadline_ns = null,
@@ -458,6 +441,19 @@ pub const SearchEngine = struct {
     pub fn deinit(self: *Self) void {
         self.deinitAccumulatorStack();
         self.allocator.destroy(self.continuation_history);
+        self.allocator.destroy(self.correction_history);
+    }
+
+    /// Start loading the TT bucket and eval-cache entry of the position just
+    /// reached; both are probed shortly after the recursive call begins.
+    inline fn prefetchChildEntries(self: *Self) void {
+        const hash = self.board.zobrist_hasher.zobrist_hash;
+        self.tt.prefetch(hash);
+        @prefetch(&self.eval_cache[evalCacheIndex(hash)], .{});
+    }
+
+    inline fn evalCacheKey(hash: u64) u32 {
+        return @truncate(hash >> 32);
     }
 
     inline fn evalCacheIndex(hash: u64) usize {
@@ -465,17 +461,12 @@ pub const SearchEngine = struct {
     }
 
     inline fn evalCacheGet(self: *Self, hash: u64) ?i32 {
-        const idx = evalCacheIndex(hash);
-        if (self.eval_cache_keys[idx] == hash) {
-            return self.eval_cache_values[idx];
-        }
-        return null;
+        const entry = &self.eval_cache[evalCacheIndex(hash)];
+        return if (entry.key == evalCacheKey(hash)) entry.value else null;
     }
 
     inline fn evalCachePut(self: *Self, hash: u64, value: i32) void {
-        const idx = evalCacheIndex(hash);
-        self.eval_cache_keys[idx] = hash;
-        self.eval_cache_values[idx] = value;
+        self.eval_cache[evalCacheIndex(hash)] = .{ .key = evalCacheKey(hash), .value = value };
     }
 
     /// Allocate and initialize the incremental accumulator stack for NNUE.
@@ -509,6 +500,7 @@ pub const SearchEngine = struct {
             self.acc_ply = 0;
             self.acc_valid = [_]bool{false} ** 128;
             self.acc_valid[0] = true;
+            self.acc_children = [_]u16{0} ** 128;
         }
     }
 
@@ -540,8 +532,27 @@ pub const SearchEngine = struct {
         if (self.acc_valid[self.acc_ply]) return;
 
         std.debug.assert(self.acc_ply > 0);
-        std.debug.assert(self.acc_valid[self.acc_ply - 1]);
         const update = self.acc_updates[self.acc_ply];
+        if (!self.acc_valid[self.acc_ply - 1]) {
+            // The parent was skipped (see prepareAccumulatorForMove), so apply
+            // both moves to the grandparent and leave the parent unbuilt.
+            const ply = self.acc_ply;
+            std.debug.assert(ply >= 2 and self.acc_valid[ply - 2] and self.p3_pawn_acc_stack == null);
+            nnue.updateAccumulatorsTwoMoves(
+                self.nnue_net.?,
+                self.board,
+                &stack[ply - 2],
+                &stack[ply],
+                self.acc_updates[ply - 1],
+                update,
+                self.acc_refresh_cache,
+            );
+            if (self.threat_acc_stack) |threat_stack| {
+                nnue.updateThreatAccumulators(self.nnue_net.?, self.board, &threat_stack[ply - 2], &threat_stack[ply]);
+            }
+            self.acc_valid[ply] = true;
+            return;
+        }
         nnue.updateAccumulators(
             self.nnue_net.?,
             self.board,
@@ -628,9 +639,15 @@ pub const SearchEngine = struct {
 
     /// A child accumulator depends on this position, so make it current before
     /// mutating the board. Nodes that cut off before this point avoid the work.
+    /// The first child may instead update straight from the grandparent, so
+    /// this accumulator is only built once a second child shows it is shared.
     inline fn prepareAccumulatorForMove(self: *Self) void {
         if (self.acc_stack != null and !self.acc_valid[self.acc_ply]) {
-            self.materializeCurrentAccumulator();
+            const ply = self.acc_ply;
+            const defer_to_child = self.acc_children[ply] == 0 and
+                self.acc_valid[ply - 1] and
+                self.p3_pawn_acc_stack == null;
+            if (!defer_to_child) self.materializeCurrentAccumulator();
         }
     }
 
@@ -638,7 +655,9 @@ pub const SearchEngine = struct {
     /// evaluation or until a searched child needs this accumulator as a base.
     inline fn pushAccumulator(self: *Self, move: Move, undo: Board.Undo) void {
         if (self.acc_stack != null) {
+            self.acc_children[self.acc_ply] += 1;
             self.acc_ply += 1;
+            self.acc_children[self.acc_ply] = 0;
             self.acc_updates[self.acc_ply] = .{
                 .from_sq = move.from(),
                 .to_sq = move.to(),
@@ -659,6 +678,23 @@ pub const SearchEngine = struct {
         if (self.acc_stack != null) {
             self.acc_ply -= 1;
         }
+    }
+
+    inline fn isTacticalMove(self: *Self, move: Move) bool {
+        if (move.promotion() != null) return true;
+        const b = &self.board.board;
+        if (b.getPieceAt(move.to(), oppositeColor(b.move)) != null) return true;
+        return b.en_passant_square == move.to() and b.getPieceAt(move.from(), b.move) == .pawn;
+    }
+
+    inline fn correctEval(self: *Self, raw_eval: i32, keys: CorrectionHistory.Keys) i32 {
+        const corrected = raw_eval + self.correction_history.correction(
+            self.board.board.move,
+            keys,
+            self.tuning.corr_pawn_weight,
+            self.tuning.corr_non_pawn_weight,
+        );
+        return std.math.clamp(corrected, -eval.MATE_BOUND + 1, eval.MATE_BOUND - 1);
     }
 
     inline fn evaluatePosition(self: *Self) i32 {
@@ -727,10 +763,9 @@ pub const SearchEngine = struct {
     /// Set the game history from prior positions (for repetition detection)
     /// Call this before search with all positions from the game so far
     pub fn setGameHistory(self: *Self, positions: []const u64) void {
-        const count = @min(positions.len, 512);
-        for (0..count) |i| {
-            self.game_history[i] = positions[i];
-        }
+        const end = if (positions.len > 0 and positions[positions.len - 1] == self.board.zobrist_hasher.zobrist_hash) positions.len - 1 else positions.len;
+        const count = @min(end, self.game_history.len);
+        @memcpy(self.game_history[0..count], positions[end - count .. end]);
         self.game_history_count = count;
     }
 
@@ -806,6 +841,7 @@ pub const SearchEngine = struct {
         // Initialize position history
         self.position_history[0] = self.board.zobrist_hasher.zobrist_hash;
         self.history_count = 1;
+        self.repetition_floor = 0;
 
         // Initialize incremental NNUE accumulators at root position
         try self.initAccumulatorStack();
@@ -827,19 +863,20 @@ pub const SearchEngine = struct {
         if (legal_moves.count == 0) {
             return SearchResult{
                 .best_move = Move.init(0, 0, null),
-                .score = 0,
+                .score = if (self.board.isInCheck(self.board.board.move)) -eval.mateIn(0) else DRAW_SCORE,
                 .nodes = 0,
                 .time_ms = 0,
                 .depth = 0,
             };
         }
 
-        // If only one legal move, return it immediately
-        if (legal_moves.count == 1) {
-            return SearchResult{
+        // Save the game clock on forced replies. Fixed-depth/node analysis and
+        // data generation still search them so their labels are meaningful.
+        if (legal_moves.count == 1 and time_budget != null and options.move_time == null and options.depth == null and options.nodes == null) {
+            return .{
                 .best_move = legal_moves.moves[0],
-                .score = 0,
-                .nodes = 1,
+                .score = self.evaluatePosition(),
+                .nodes = 0,
                 .time_ms = elapsedMs(start_time),
                 .depth = 0,
             };
@@ -848,7 +885,7 @@ pub const SearchEngine = struct {
         var best_move = legal_moves.moves[0];
         var best_score: i32 = -INF;
         self.root_best_move = best_move;
-        const max_depth: u32 = if (options.depth) |d| @intCast(d) else 64;
+        const max_depth: u32 = @intCast(@min(options.depth orelse 64, MAX_PLY - 1));
         var completed_depth: u32 = 0;
         var previous_completed_move: ?Move = null;
         var previous_completed_score: ?i32 = null;
@@ -866,7 +903,7 @@ pub const SearchEngine = struct {
             // Aspiration windows - narrow search window around previous score
             var asp_alpha: i32 = -INF;
             var asp_beta: i32 = INF;
-            var asp_delta: i32 = 25;
+            var asp_delta: i32 = self.tuning.asp_delta;
 
             if (depth >= 4 and !eval.isMateScore(best_score)) {
                 asp_alpha = @max(best_score - asp_delta, -INF);
@@ -884,11 +921,11 @@ pub const SearchEngine = struct {
                 if (score <= asp_alpha) {
                     // Fail low - widen alpha
                     asp_alpha = @max(asp_alpha - asp_delta, -INF);
-                    asp_delta *= 2;
+                    asp_delta = @max(asp_delta + 1, @divTrunc(asp_delta * self.tuning.asp_widen_pct, 100));
                 } else if (score >= asp_beta) {
                     // Fail high - widen beta
                     asp_beta = @min(asp_beta + asp_delta, INF);
-                    asp_delta *= 2;
+                    asp_delta = @max(asp_delta + 1, @divTrunc(asp_delta * self.tuning.asp_widen_pct, 100));
                 } else {
                     break; // Score within window
                 }
@@ -934,21 +971,19 @@ pub const SearchEngine = struct {
             }
 
             // Only the main worker acts on soft time. All workers enforce hard time.
-            if (options.enforce_soft_limit) {
+            if (options.enforce_soft_limit and options.move_time == null) {
                 if (time_budget) |budget| {
                     const total_time_ms: u64 = @intCast(@max(total_time, 0));
                     const iter_time_ms: u64 = @intCast(@max(iter_time, 0));
-                    const soft_limit = if (options.move_time == null)
-                        adaptiveSoftLimit(
-                            budget,
-                            depth,
-                            self.root_move_nodes[rootMoveBucket(best_move)],
-                            iteration_nodes,
-                            best_move_stability,
-                            score_delta,
-                        )
-                    else
-                        budget.soft_ms;
+                    const soft_limit = adaptiveSoftLimit(
+                        budget,
+                        depth,
+                        self.root_move_nodes[rootMoveBucket(best_move)],
+                        iteration_nodes,
+                        best_move_stability,
+                        score_delta,
+                        &self.tuning,
+                    );
                     if (total_time_ms >= soft_limit or total_time_ms +| (iter_time_ms *| 2) >= soft_limit) {
                         break;
                     }
@@ -1037,7 +1072,7 @@ pub const SearchEngine = struct {
                 tt_move = entry.best_move;
             }
 
-            if (!is_pv_node and entry.depth >= search_depth) {
+            if (self.ttScoreUsable() and !is_pv_node and entry.depth >= search_depth) {
                 const tt_score = scoreFromTT(entry.score, ply);
                 switch (entry.bound()) {
                     .exact => return .{
@@ -1071,7 +1106,7 @@ pub const SearchEngine = struct {
                 }
             }
 
-            const tt_score = scoreFromTT(entry.score, ply);
+            const tt_score: ?i32 = if (self.ttScoreUsable()) scoreFromTT(entry.score, ply) else null;
             return .{
                 .tt_move = tt_move,
                 .cutoff = null,
@@ -1118,11 +1153,11 @@ pub const SearchEngine = struct {
         if (tt_bound != .exact and tt_bound != .lower_bound) {
             return .{ .extension = 0, .cutoff = null };
         }
-        if (tt_probe.tt_depth < search_depth or search_depth < SINGULAR_MIN_DEPTH or eval.isMateScore(tt_score)) {
+        if (tt_probe.tt_depth < search_depth or search_depth < self.tuning.singular_min_depth or eval.isMateScore(tt_score)) {
             return .{ .extension = 0, .cutoff = null };
         }
 
-        const singular_margin = SINGULAR_MARGIN_BASE_CP + SINGULAR_MARGIN_PER_PLY_CP * @as(i32, @intCast(search_depth));
+        const singular_margin = self.tuning.singular_margin_base + self.tuning.singular_margin_per_ply * @as(i32, @intCast(search_depth));
         const singular_beta = @max(tt_score - singular_margin, -INF);
         if (search_depth <= SINGULAR_REDUCTION + 1) {
             return .{ .extension = 0, .cutoff = null };
@@ -1156,6 +1191,7 @@ pub const SearchEngine = struct {
 
             self.prepareAccumulatorForMove();
             const undo = self.board.makeMoveWithUndoUnchecked(move);
+            self.prefetchChildEntries();
             self.pushAccumulator(move, undo);
             self.previous_move = move;
             if (ply < MAX_PLY and moving_piece != null) {
@@ -1206,10 +1242,14 @@ pub const SearchEngine = struct {
         beta_adj: i32,
         cached_static_eval: ?i32,
     ) StaticEvalContext {
-        const static_eval = if (!in_check)
+        // Start the correction-history loads before the (slow) NNUE eval.
+        const correction_keys = CorrectionHistory.keys(&self.board.board);
+        if (!in_check) self.correction_history.prefetch(self.board.board.move, correction_keys);
+        const raw_eval = if (!in_check)
             cached_static_eval orelse self.evaluatePosition()
         else
             -INF;
+        const static_eval = if (!in_check) self.correctEval(raw_eval, correction_keys) else -INF;
         const improving = blk: {
             if (in_check or ply < 2 or ply >= STATIC_EVAL_STACK_SIZE) {
                 break :blk false;
@@ -1222,9 +1262,9 @@ pub const SearchEngine = struct {
         }
 
         var futile = false;
-        if (!is_pv_node and !in_check and search_depth <= 3) {
-            var futility_margin = FUTILITY_MARGIN + FUTILITY_MARGIN_MULTIPLIER * @as(i32, @intCast(search_depth));
-            if (improving) futility_margin += 80;
+        if (!is_pv_node and !in_check and search_depth <= self.tuning.futility_max_depth) {
+            var futility_margin = self.tuning.futility_base + self.tuning.futility_mult * @as(i32, @intCast(search_depth));
+            if (improving) futility_margin += self.tuning.futility_improving;
             if (static_eval + futility_margin < alpha) {
                 futile = true;
             }
@@ -1233,20 +1273,25 @@ pub const SearchEngine = struct {
         _ = beta_adj;
         return .{
             .static_eval = static_eval,
+            .raw_eval = raw_eval,
+            .correction_keys = correction_keys,
             .improving = improving,
             .futile = futile,
         };
     }
 
     inline fn tryReverseFutilityPrune(
+        self: *const Self,
         is_pv_node: bool,
         in_check: bool,
         search_depth: u32,
         static_eval: i32,
         beta_adj: i32,
+        improving: bool,
     ) ?i32 {
-        if (!is_pv_node and !in_check and search_depth <= 5) {
-            const rfp_margin = REVERSE_FUTILITY_MARGIN_PER_PLY * @as(i32, @intCast(search_depth));
+        if (!is_pv_node and !in_check and search_depth <= self.tuning.rfp_max_depth and !eval.isMateScore(beta_adj)) {
+            const improving_margin: i32 = if (improving) self.tuning.rfp_improving_margin else 0;
+            const rfp_margin = self.tuning.rfp_margin * @as(i32, @intCast(search_depth)) - improving_margin;
             if (static_eval - rfp_margin >= beta_adj) {
                 return static_eval;
             }
@@ -1264,7 +1309,7 @@ pub const SearchEngine = struct {
         beta_adj: i32,
         ply: u32,
     ) !?i32 {
-        if (!is_pv_node and !in_check and search_depth <= 2 and static_eval + RAZOR_MARGIN < alpha) {
+        if (!is_pv_node and !in_check and search_depth <= 2 and static_eval + self.tuning.razor_margin < alpha) {
             const razor_score = try self.quiescence(alpha, beta_adj, ply);
             if (razor_score < alpha) {
                 return razor_score;
@@ -1286,8 +1331,9 @@ pub const SearchEngine = struct {
         if (!(do_null and
             !is_pv_node and
             !in_check and
-            search_depth >= NULL_MOVE_MIN_DEPTH and
-            static_eval >= beta_adj + NULL_MOVE_STATIC_EVAL_MARGIN))
+            self.ttScoreUsable() and
+            search_depth >= self.tuning.nmp_min_depth and
+            static_eval >= beta_adj + self.tuning.nmp_eval_margin))
         {
             return null;
         }
@@ -1321,13 +1367,21 @@ pub const SearchEngine = struct {
             self.continuation_keys[ply] = INVALID_CONTINUATION_KEY;
         }
 
-        var reduction: u32 = NULL_MOVE_REDUCTION;
+        var reduction: u32 = self.tuning.nmp_base_reduction;
         if (search_depth > NULL_MOVE_DEEP_DEPTH) reduction += 1;
-        if (static_eval - beta_adj > 200) reduction += 1;
+        if (static_eval - beta_adj > self.tuning.nmp_eval_reduce_margin) reduction += 1;
         reduction = @min(reduction, search_depth - 1);
+
+        const old_hist_count = self.history_count;
+        const old_repetition_floor = self.repetition_floor;
+        self.position_history[self.history_count] = self.board.zobrist_hasher.zobrist_hash;
+        self.history_count += 1;
+        self.repetition_floor = self.combinedHistoryCount() - 1;
 
         const null_score = -try self.alphaBeta(-beta_adj, -beta_adj + 1, search_depth -| reduction, ply + 1, false);
 
+        self.history_count = old_hist_count;
+        self.repetition_floor = old_repetition_floor;
         self.board.board = old_board;
         self.board.zobrist_hasher.zobrist_hash = old_hash;
         if (ply < MAX_PLY) {
@@ -1362,14 +1416,14 @@ pub const SearchEngine = struct {
             is_pv_node or
             in_check or
             ply == 0 or
-            search_depth < PROBCUT_MIN_DEPTH or
-            beta_adj <= -eval.MATE_BOUND + PROBCUT_MARGIN_CP or
-            beta_adj >= eval.MATE_BOUND - PROBCUT_MARGIN_CP)
+            search_depth < self.tuning.probcut_min_depth or
+            beta_adj <= -eval.MATE_BOUND + self.tuning.probcut_margin or
+            beta_adj >= eval.MATE_BOUND - self.tuning.probcut_margin)
         {
             return null;
         }
 
-        const probcut_beta = beta_adj + PROBCUT_MARGIN_CP;
+        const probcut_beta = beta_adj + self.tuning.probcut_margin;
         const see_threshold = @max(@as(i32, 0), probcut_beta - static_eval);
 
         var tactical_moves = MoveList.init();
@@ -1387,6 +1441,7 @@ pub const SearchEngine = struct {
 
             self.prepareAccumulatorForMove();
             const undo = self.board.makeMoveWithUndoUnchecked(move);
+            self.prefetchChildEntries();
             self.pushAccumulator(move, undo);
             self.previous_move = move;
             if (ply < MAX_PLY) {
@@ -1423,6 +1478,11 @@ pub const SearchEngine = struct {
         return null;
     }
 
+    inline fn historyBonus(self: *const Self, depth: u32) i32 {
+        const scaled = @divTrunc(@as(i64, depth) * @as(i64, depth) * @as(i64, self.tuning.history_bonus_scale_pct), 100);
+        return @intCast(std.math.clamp(scaled, 0, @as(i64, self.tuning.history_max_bonus)));
+    }
+
     fn updateQuietHeuristicsOnBetaCutoff(
         self: *Self,
         move: Move,
@@ -1432,13 +1492,14 @@ pub const SearchEngine = struct {
         old_previous: ?Move,
         quiets_tried: []const Move,
     ) void {
+        const bonus = self.historyBonus(search_depth);
         self.killer_moves.add(move, ply);
-        self.history.update(move, search_depth, color, self.tuning.history_max_bonus);
+        self.history.update(move, bonus, color);
 
         if (self.board.board.getPieceAt(move.from(), color)) |piece_type| {
             const ctx = self.continuationContext(ply);
             const best_key = continuationKey(color, piece_type, move.to());
-            self.continuation_history.update(ctx.prev, ctx.prev2, best_key, search_depth, self.tuning.history_max_bonus);
+            self.continuation_history.update(ctx.prev, ctx.prev2, best_key, bonus);
 
             for (quiets_tried) |quiet| {
                 if ((quiet.from() != move.from() or quiet.to() != move.to()) and
@@ -1446,7 +1507,7 @@ pub const SearchEngine = struct {
                 {
                     const quiet_piece = self.board.board.getPieceAt(quiet.from(), color).?;
                     const quiet_key = continuationKey(color, quiet_piece, quiet.to());
-                    self.continuation_history.penalize(ctx.prev, ctx.prev2, quiet_key, search_depth, self.tuning.history_max_bonus);
+                    self.continuation_history.penalize(ctx.prev, ctx.prev2, quiet_key, bonus);
                 }
             }
         }
@@ -1457,7 +1518,7 @@ pub const SearchEngine = struct {
 
         for (quiets_tried) |quiet| {
             if (quiet.from() != move.from() or quiet.to() != move.to()) {
-                self.history.penalize(quiet, search_depth, color, self.tuning.history_max_bonus);
+                self.history.penalize(quiet, bonus, color);
             }
         }
     }
@@ -1472,6 +1533,7 @@ pub const SearchEngine = struct {
         best_move: ?Move,
         static_eval: ?i32,
     ) void {
+        if (!self.ttScoreUsable()) return;
         const bound: TTEntryBound = if (best_score <= original_alpha)
             .upper_bound
         else if (best_score >= beta_adj)
@@ -1498,6 +1560,7 @@ pub const SearchEngine = struct {
         best_move: ?Move,
         static_eval: ?i32,
     ) void {
+        if (!self.ttScoreUsable()) return;
         const bound: TTEntryBound = if (best_score <= original_alpha)
             .upper_bound
         else if (best_score >= beta)
@@ -1528,17 +1591,9 @@ pub const SearchEngine = struct {
 
         self.seldepth = @max(self.seldepth, ply);
 
-        // Check for draw by repetition
-        if (ply > 0 and self.isRepetition()) {
-            return self.repetitionScore();
-        }
-
-        // Check for draw by 50 move rule
-        if (self.board.board.halfmove_clock >= 100) {
-            return DRAW_SCORE;
-        }
-
         const in_check = self.board.isInCheck(self.board.board.move);
+        if (try self.terminalScore(ply, in_check)) |score| return score;
+
         var alpha = alpha_in;
         var beta_adj = beta;
 
@@ -1591,7 +1646,7 @@ pub const SearchEngine = struct {
         const improving = eval_ctx.improving;
         const futile = eval_ctx.futile;
 
-        if (tryReverseFutilityPrune(is_pv_node, in_check, search_depth, static_eval, beta_adj)) |pruned| {
+        if (self.tryReverseFutilityPrune(is_pv_node, in_check, search_depth, static_eval, beta_adj, improving)) |pruned| {
             return pruned;
         }
 
@@ -1651,7 +1706,7 @@ pub const SearchEngine = struct {
 
             var speculative_sac_candidate = false;
             var speculative_sac_see: i32 = 0;
-            if (ply == 0 and !in_check and is_capture and !is_promotion and moving_piece != null and captured_piece != null) {
+            if (!(self.use_nnue and self.nnue_net != null and self.nnue_blend == 100) and ply == 0 and !in_check and is_capture and !is_promotion and moving_piece != null and captured_piece != null) {
                 const attacker = moving_piece.?;
                 const victim = captured_piece.?;
                 const to_file = move.to() % 8;
@@ -1662,12 +1717,12 @@ pub const SearchEngine = struct {
                 }
             }
 
-            var quiet_history_score: ?i32 = null;
+            const quiet_history_score = if (!is_capture and !is_promotion) self.quietHeuristicScore(move, color, ply) else 0;
             if (!is_capture and !is_promotion) {
                 quiets_seen += 1;
                 const is_killer = self.killer_moves.isKiller(move, ply);
                 const is_counter_move = if (counter_move) |counter| movesEqual(move, counter) else false;
-                const improving_lmp_bonus: u32 = if (improving) LMP_IMPROVING_BONUS else 0;
+                const improving_lmp_bonus: u32 = if (improving) self.tuning.lmp_improving_bonus else 0;
                 const quiet_lmp_limit = addLmpQuietMoveBonus(
                     lmpQuietMoveLimit(search_depth, self.tuning.lmp_move_scale_pct),
                     improving_lmp_bonus,
@@ -1676,26 +1731,24 @@ pub const SearchEngine = struct {
                 // Late Move Pruning (LMP): at shallow non-PV nodes, trim low-history late quiets.
                 if (!is_pv_node and
                     !in_check and
-                    search_depth <= LMP_MAX_DEPTH and
+                    search_depth <= self.tuning.lmp_max_depth and
                     moves_searched > 0 and
                     quiets_seen > quiet_lmp_limit and
                     !is_killer)
                 {
-                    const history_score = self.quietHeuristicScore(move, color, ply);
-                    quiet_history_score = history_score;
-                    if (history_score <= 0) continue;
+                    if (quiet_history_score <= 0) continue;
                 }
 
                 // Quiet SEE pruning: trim late moves that leave material hanging.
                 if (!is_pv_node and
                     !in_check and
                     moves_searched > 0 and
-                    search_depth <= QUIET_SEE_PRUNE_MAX_DEPTH and
+                    search_depth <= self.tuning.quiet_see_max_depth and
                     !is_killer and
                     !is_counter_move and
                     !self.moveGivesCheck(move))
                 {
-                    const see_margin = QUIET_SEE_PRUNE_MARGIN_PER_PLY_CP * @as(i32, @intCast(search_depth));
+                    const see_margin = self.tuning.quiet_see_margin * @as(i32, @intCast(search_depth));
                     if (staticExchangeEvalQuietPosition(&self.board.board, move) < -see_margin) {
                         continue;
                     }
@@ -1708,12 +1761,12 @@ pub const SearchEngine = struct {
                 is_capture and
                 !is_promotion and
                 moves_searched > 0 and
-                search_depth <= MAIN_SEE_PRUNE_MAX_DEPTH)
+                search_depth <= self.tuning.main_see_max_depth)
             {
                 const is_tt_move = tt_move != null and movesEqual(move, tt_move.?);
                 if (!is_tt_move) {
                     const see_score = staticExchangeEvalPosition(&self.board.board, move);
-                    const see_margin = MAIN_SEE_PRUNE_MARGIN_PER_PLY_CP * @as(i32, @intCast(search_depth));
+                    const see_margin = self.tuning.main_see_margin * @as(i32, @intCast(search_depth));
                     if (see_score < -see_margin and !self.moveGivesCheck(move)) {
                         continue;
                     }
@@ -1732,6 +1785,7 @@ pub const SearchEngine = struct {
             // Make move
             self.prepareAccumulatorForMove();
             const undo = self.board.makeMoveWithUndoUnchecked(move);
+            self.prefetchChildEntries();
             self.pushAccumulator(move, undo);
             self.previous_move = move;
             const old_continuation_key = if (ply < MAX_PLY) self.continuation_keys[ply] else INVALID_CONTINUATION_KEY;
@@ -1760,27 +1814,30 @@ pub const SearchEngine = struct {
 
             // Late Move Reductions (LMR) — logarithmic formula with history modulation
             if (moves_searched >= self.tuning.lmr_full_depth_moves and
-                search_depth >= LMR_MIN_DEPTH and
+                search_depth >= self.tuning.lmr_min_depth and
                 !in_check and
                 !is_capture and
                 !is_promotion and
                 !gives_check)
             {
-                // Base reduction from pre-computed log table
+                // Base reduction from pre-computed log table, accumulated in
+                // 1/LMR_GRAIN plies so every adjustment is a smooth tuning knob.
                 const move_number = moves_searched + 1;
                 const d_idx = @min(search_depth, LMR_TABLE_MAX_DEPTH - 1);
                 const m_idx = @min(move_number, LMR_TABLE_MAX_MOVES - 1);
-                var reduction: i32 = @intCast(@divTrunc(
-                    @as(i64, lmr_table_x100[d_idx][m_idx]) * @as(i64, self.tuning.lmr_scale_pct),
+                var reduction: i64 = @divTrunc(
+                    (@as(i64, self.tuning.lmr_base_x100) * 100 +
+                        @as(i64, lmr_table_x100[d_idx][m_idx]) * @as(i64, self.tuning.lmr_scale_pct)) * LMR_GRAIN,
                     10_000,
-                ));
+                );
 
                 // History modulation: good history reduces less, bad history reduces more
-                const history_score = quiet_history_score orelse self.quietHeuristicScore(move, color, ply);
-                reduction -= @intCast(@divTrunc(
+                // (819200 history at 100% scale is one ply).
+                const history_score = quiet_history_score;
+                reduction -= @divTrunc(
                     @as(i64, history_score) * @as(i64, self.tuning.lmr_history_scale_pct),
-                    819_200,
-                ));
+                    819_200 / LMR_GRAIN,
+                );
 
                 // Killer and counter moves get reduced less
                 const is_killer = self.killer_moves.isKiller(move, ply);
@@ -1789,21 +1846,22 @@ pub const SearchEngine = struct {
                     is_counter_move = cm.from() == move.from() and cm.to() == move.to();
                 }
                 if (is_killer) {
-                    reduction -= 1;
+                    reduction -= self.tuning.lmr_killer;
                 }
                 if (is_counter_move) {
-                    reduction -= 1;
+                    reduction -= self.tuning.lmr_counter;
                 }
                 if (improving) {
-                    reduction -= 1;
+                    reduction -= self.tuning.lmr_improving;
                 }
 
                 // PV nodes get reduced less
                 if (is_pv_node) {
-                    reduction -= 1;
+                    reduction -= self.tuning.lmr_pv;
                 }
                 // Clamp reduction: at least 1, at most depth-2 (leave at least 1 ply)
-                const r: u32 = @intCast(@max(1, @min(reduction, @as(i32, @intCast(next_depth)) - 1)));
+                const reduction_plies: i64 = @divTrunc(reduction, LMR_GRAIN);
+                const r: u32 = @intCast(@max(1, @min(reduction_plies, @as(i64, next_depth) - 1)));
 
                 // Search with reduced depth
                 score = -try self.alphaBeta(-alpha - 1, -alpha, next_depth - r, ply + 1, true);
@@ -1822,8 +1880,9 @@ pub const SearchEngine = struct {
                 }
             }
 
-            // Full window search if PVS failed high or first move
-            if (score > alpha) {
+            // A full-depth fail-high already proves the cutoff, unless the
+            // later sacrifice penalty can lower it below beta.
+            if (moves_searched == 0 or (score > alpha and (score < beta_adj or speculative_sac_candidate))) {
                 score = -try self.alphaBeta(-beta, -alpha, next_depth, ply + 1, true);
             }
 
@@ -1892,6 +1951,23 @@ pub const SearchEngine = struct {
             }
         }
 
+        if (!in_check and self.ttScoreUsable() and !eval.isMateScore(best_score)) {
+            const best_is_quiet = if (best_move) |m| !self.isTacticalMove(m) else true;
+            const failed_low = best_score <= original_alpha;
+            const failed_high = best_score >= beta_adj;
+            if (best_is_quiet and
+                !(failed_high and best_score <= static_eval) and
+                !(failed_low and best_score >= static_eval))
+            {
+                self.correction_history.update(
+                    self.board.board.move,
+                    eval_ctx.correction_keys,
+                    search_depth,
+                    best_score - static_eval,
+                );
+            }
+        }
+
         self.storeAlphaBetaResult(
             best_score,
             original_alpha,
@@ -1899,7 +1975,7 @@ pub const SearchEngine = struct {
             search_depth,
             ply,
             best_move,
-            if (in_check) null else static_eval,
+            if (in_check) null else eval_ctx.raw_eval,
         );
 
         return best_score;
@@ -1959,27 +2035,44 @@ pub const SearchEngine = struct {
         return false;
     }
 
-    /// Check for repetition draw.
-    /// Any single repetition match (twofold) is enough — if the engine has reached
-    /// the same position before (whether in game history or search tree), continuing
-    /// will just lead to threefold repetition in practice.
+    /// A cycle within the search is a draw; pre-root history requires threefold.
     fn isRepetition(self: *Self) bool {
         const current_hash = self.board.zobrist_hasher.zobrist_hash;
         const total = self.combinedHistoryCount();
         if (total < 3) return false;
-
-        const halfmove = @as(usize, @intCast(self.board.board.halfmove_clock));
-        if (halfmove < 4) return false;
-        const max_back = @min(halfmove, total - 1);
-
-        var plies_back: usize = 2;
+        const halfmove: usize = self.board.board.halfmove_clock;
+        const max_back = @min(halfmove, total - 1 - self.repetition_floor);
+        var prior_matches: u32 = 0;
+        var plies_back: usize = 4;
         while (plies_back <= max_back) : (plies_back += 2) {
             const idx = total - 1 - plies_back;
             if (self.hashAtCombinedIndex(idx) == current_hash) {
-                return true;
+                if (idx >= self.game_history_count) return true;
+                prior_matches += 1;
+                if (prior_matches >= 2) return true;
             }
         }
         return false;
+    }
+
+    fn ttScoreUsable(self: *const Self) bool {
+        // Preserve move ordering and raw static eval, but do not use search
+        // bounds from a different rule-50 context close to the draw boundary.
+        return self.board.board.halfmove_clock < 96;
+    }
+
+    fn terminalScore(self: *Self, ply: u32, in_check: bool) !?i32 {
+        if (self.board.board.halfmove_clock >= 100 or ply >= MAX_PLY - 1) {
+            if (in_check) {
+                var evasions = MoveList.init();
+                try self.board.generateLegalMoves(&evasions);
+                if (evasions.count == 0) return -eval.mateIn(ply);
+            }
+            if (self.board.board.halfmove_clock >= 100 or in_check) return DRAW_SCORE;
+            return self.evaluatePosition();
+        }
+        if (self.isRepetition()) return DRAW_SCORE;
+        return null;
     }
 
     fn repetitionScore(self: *Self) i32 {
@@ -2015,8 +2108,20 @@ pub const SearchEngine = struct {
         if (!self.recordNode()) return 0;
         self.seldepth = @max(self.seldepth, ply);
 
-        // Check if we're in check - if so, we must search all evasions (not just captures)
         const in_check = self.board.isInCheck(self.board.board.move);
+        if (try self.terminalScore(ply, in_check)) |score| return score;
+        var moves = MoveList.init();
+        if (in_check) {
+            try self.board.generateLegalMoves(&moves);
+            if (moves.count == 0) return -eval.mateIn(ply);
+        } else {
+            self.board.generateLegalCaptures(&moves);
+            if (moves.count == 0) {
+                var quiets = MoveList.init();
+                self.board.generateLegalQuietMoves(&quiets);
+                if (quiets.count == 0) return DRAW_SCORE;
+            }
+        }
 
         var alpha = alpha_in;
         const original_alpha = alpha_in;
@@ -2030,7 +2135,7 @@ pub const SearchEngine = struct {
                 tt_move = entry.best_move;
             }
 
-            if (!is_pv_node) {
+            if (self.ttScoreUsable() and !is_pv_node) {
                 const tt_score = scoreFromTT(entry.score, ply);
                 switch (entry.bound()) {
                     .exact => return tt_score,
@@ -2046,11 +2151,15 @@ pub const SearchEngine = struct {
 
         // Stand pat - but only when not in check
         var stand_pat: i32 = -INF;
+        var raw_eval: i32 = -INF;
         if (!in_check) {
-            stand_pat = tt_static_eval orelse self.evaluatePosition();
+            const correction_keys = CorrectionHistory.keys(&self.board.board);
+            self.correction_history.prefetch(self.board.board.move, correction_keys);
+            raw_eval = tt_static_eval orelse self.evaluatePosition();
+            stand_pat = self.correctEval(raw_eval, correction_keys);
 
             if (stand_pat >= beta) {
-                self.storeQuiescenceResult(stand_pat, original_alpha, beta, ply, tt_move, stand_pat);
+                self.storeQuiescenceResult(stand_pat, original_alpha, beta, ply, tt_move, raw_eval);
                 return beta;
             }
             if (alpha < stand_pat) {
@@ -2058,22 +2167,7 @@ pub const SearchEngine = struct {
             }
         }
 
-        // Generate moves - all moves if in check, only captures otherwise
-        var moves = MoveList.init();
-        if (in_check) {
-            // When in check, we need to search all legal moves to find an escape
-            try self.board.generateLegalMoves(&moves);
-        } else {
-            self.board.generateLegalCaptures(&moves);
-        }
-
-        // Check for checkmate/stalemate when in check with no moves
-        if (moves.count == 0) {
-            if (in_check) {
-                return -eval.mateIn(ply); // Checkmate
-            }
-            return stand_pat; // No captures available, return stand pat
-        }
+        if (moves.count == 0) return stand_pat;
 
         // Order captures by MVV-LVA
         self.orderCaptures(&moves);
@@ -2113,8 +2207,7 @@ pub const SearchEngine = struct {
                 else
                     0;
 
-                // Delta pruning margin increased to 300 to avoid being too aggressive
-                if (stand_pat + captured_value + promo_value + 300 < alpha) {
+                if (stand_pat + captured_value + promo_value + self.tuning.qs_delta_margin < alpha) {
                     continue; // Futile capture
                 }
 
@@ -2122,7 +2215,7 @@ pub const SearchEngine = struct {
                 if (move.promotion() == null) {
                     const is_tt_move = tt_move != null and movesEqual(move, tt_move.?);
                     if (!is_tt_move and
-                        staticExchangeEvalPosition(&self.board.board, move) < QS_SEE_PRUNE_MARGIN_CP and
+                        staticExchangeEvalPosition(&self.board.board, move) < self.tuning.qs_see_threshold and
                         !self.moveGivesCheck(move))
                     {
                         continue;
@@ -2133,7 +2226,12 @@ pub const SearchEngine = struct {
             // Make move
             self.prepareAccumulatorForMove();
             const undo = self.board.makeMoveWithUndoUnchecked(move);
+            self.prefetchChildEntries();
             self.pushAccumulator(move, undo);
+
+            const old_hist_count = self.history_count;
+            self.position_history[self.history_count] = self.board.zobrist_hasher.zobrist_hash;
+            self.history_count += 1;
 
             // Recursive search
             const score = -try self.quiescence(-beta, -alpha, ply + 1);
@@ -2141,6 +2239,7 @@ pub const SearchEngine = struct {
             // Unmake move
             self.popAccumulator();
             self.board.unmakeMoveUnchecked(move, undo);
+            self.history_count = old_hist_count;
 
             if (self.stop_search.load(.monotonic)) return 0;
 
@@ -2151,7 +2250,7 @@ pub const SearchEngine = struct {
                     beta,
                     ply,
                     move,
-                    if (in_check) null else stand_pat,
+                    if (in_check) null else raw_eval,
                 );
                 return beta;
             }
@@ -2167,7 +2266,7 @@ pub const SearchEngine = struct {
             beta,
             ply,
             best_move,
-            if (in_check) null else stand_pat,
+            if (in_check) null else raw_eval,
         );
         return alpha;
     }
@@ -2279,16 +2378,16 @@ test "time budget stays inside usable clock and preserves fixed movetime" {
 
 test "adaptive soft limit spends more on unstable roots and less on stable roots" {
     const budget = TimeBudget{ .soft_ms = 100, .hard_ms = 400 };
-    try std.testing.expectEqual(@as(u64, 100), adaptiveSoftLimit(budget, 4, 300, 1000, 0, 40));
+    try std.testing.expectEqual(@as(u64, 100), adaptiveSoftLimit(budget, 4, 300, 1000, 0, 40, &SearchTuning{}));
 
-    const unstable = adaptiveSoftLimit(budget, 8, 300, 1000, 0, 40);
-    const stable = adaptiveSoftLimit(budget, 8, 900, 1000, 14, 0);
+    const unstable = adaptiveSoftLimit(budget, 8, 300, 1000, 0, 40, &SearchTuning{});
+    const stable = adaptiveSoftLimit(budget, 8, 900, 1000, 14, 0, &SearchTuning{});
     try std.testing.expect(unstable > budget.soft_ms);
     try std.testing.expect(stable < budget.soft_ms);
     try std.testing.expect(unstable <= budget.hard_ms);
     try std.testing.expect(stable <= budget.hard_ms);
 
-    const capped = adaptiveSoftLimit(.{ .soft_ms = 500, .hard_ms = 600 }, 8, 300, 1000, 0, 40);
+    const capped = adaptiveSoftLimit(.{ .soft_ms = 500, .hard_ms = 600 }, 8, 300, 1000, 0, 40, &SearchTuning{});
     try std.testing.expectEqual(@as(u64, 600), capped);
 }
 test "quiet SEE detects hanging pieces without changing safe quiets" {
@@ -2305,4 +2404,103 @@ test "quiet SEE detects hanging pieces without changing safe quiets" {
         @as(i32, 0),
         staticExchangeEvalQuietPosition(&test_board.board, safe),
     );
+}
+
+test "SEE excludes illegal pinned and king recaptures but keeps captures along a pin ray" {
+    const cases = .{
+        .{ "4k3/8/8/3pr3/2B5/8/8/K2QR3 w - - 0 1", "d1d5", eval.PAWN_VALUE },
+        .{ "4k3/8/8/4r3/3Qp3/8/8/K3R3 w - - 0 1", "d4e4", eval.PAWN_VALUE - eval.QUEEN_VALUE + eval.ROOK_VALUE },
+        .{ "7k/6p1/5B2/8/8/8/8/K5Q1 w - - 0 1", "g1g7", eval.PAWN_VALUE },
+        .{ "7k/6p1/8/8/8/8/8/K5Q1 w - - 0 1", "g1g7", eval.PAWN_VALUE - eval.QUEEN_VALUE },
+        .{ "r7/1P4k1/8/8/8/8/8/K7 w - - 0 1", "b7a8q", eval.ROOK_VALUE + eval.QUEEN_VALUE - eval.PAWN_VALUE },
+        .{ "3r3k/8/8/3pP3/8/8/8/K7 w - d6 0 1", "e5d6", 0 },
+    };
+    inline for (cases) |case| {
+        var b = try Board.fromFen(case[0]);
+        const move = try Move.fromString(case[1]);
+        var legal = MoveList.init();
+        try b.generateLegalMoves(&legal);
+        var found = false;
+        for (legal.slice()) |m| {
+            if (movesEqual(m, move)) found = true;
+        }
+        try std.testing.expect(found);
+        try std.testing.expectEqual(@as(i32, case[2]), staticExchangeEvalPosition(&b.board, move));
+    }
+}
+
+test "draw and mate precedence are shared by alpha beta and quiescence" {
+    var b = try Board.fromFen("7k/8/8/8/8/8/8/KQ6 w - - 100 1");
+    var tt = try TranspositionTable.init(std.testing.allocator, 1);
+    defer tt.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    const engine = try std.testing.allocator.create(SearchEngine);
+    defer std.testing.allocator.destroy(engine);
+    engine.* = try SearchEngine.init(&b, std.testing.allocator, &stop, null, &tt, false, null, 100, 100);
+    defer engine.deinit();
+    try std.testing.expectEqual(DRAW_SCORE, try engine.alphaBeta(-INF, INF, 4, 1, true));
+    try std.testing.expectEqual(DRAW_SCORE, try engine.quiescence(-INF, INF, 1));
+    b = try Board.fromFen("7k/6Q1/5K2/8/8/8/8/8 b - - 100 1");
+    try std.testing.expectEqual(-eval.mateIn(1), try engine.alphaBeta(-INF, INF, 4, 1, true));
+    try std.testing.expectEqual(-eval.mateIn(1), try engine.quiescence(-INF, INF, 1));
+    b = try Board.fromFen("7k/5K2/6Q1/8/8/8/8/8 b - - 0 1");
+    try std.testing.expectEqual(DRAW_SCORE, try engine.quiescence(-2000, -1999, 1));
+    // The stack guard must also preserve mate precedence.
+    b = try Board.fromFen("7k/6Q1/5K2/8/8/8/8/8 b - - 0 1");
+    try std.testing.expectEqual(-eval.mateIn(MAX_PLY - 1), try engine.alphaBeta(-INF, INF, 4, MAX_PLY - 1, true));
+    b = Board.startpos();
+    try std.testing.expectEqual(engine.evaluatePosition(), try engine.quiescence(-INF, INF, MAX_PLY - 1));
+}
+
+test "rule fifty context blocks old TT bounds while retaining the move" {
+    var b = try Board.fromFen("7k/8/8/8/8/8/8/KQ6 w - - 0 1");
+    var tt = try TranspositionTable.init(std.testing.allocator, 1);
+    defer tt.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    const engine = try std.testing.allocator.create(SearchEngine);
+    defer std.testing.allocator.destroy(engine);
+    engine.* = try SearchEngine.init(&b, std.testing.allocator, &stop, null, &tt, false, null, 100, 100);
+    defer engine.deinit();
+    _ = try engine.alphaBeta(1999, 2000, 4, 1, true);
+    b.board.halfmove_clock = 99;
+    const probe = engine.probeTransposition(4, 1, false, 1999, 2000);
+    try std.testing.expect(probe.tt_move != null);
+    try std.testing.expectEqual(@as(?i32, null), probe.cutoff);
+    try std.testing.expectEqual(@as(?i32, null), probe.tt_score);
+    try std.testing.expectEqual(DRAW_SCORE, try engine.alphaBeta(1999, 2000, 4, 1, true));
+    tt.clear();
+    try std.testing.expectEqual(DRAW_SCORE, try engine.alphaBeta(1999, 2000, 4, 1, true));
+    try std.testing.expect(tt.probe(b.zobrist_hasher.zobrist_hash) == null);
+}
+
+test "repetition distinguishes game threefold from search cycles and null boundaries" {
+    var b = Board.startpos();
+    var tt = try TranspositionTable.init(std.testing.allocator, 1);
+    defer tt.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    const engine = try std.testing.allocator.create(SearchEngine);
+    defer std.testing.allocator.destroy(engine);
+    engine.* = try SearchEngine.init(&b, std.testing.allocator, &stop, null, &tt, false, null, 100, 100);
+    defer engine.deinit();
+    var hashes: [9]u64 = undefined;
+    hashes[0] = b.zobrist_hasher.zobrist_hash;
+    const cycle = [_][]const u8{ "g1f3", "g8f6", "f3g1", "f6g8" };
+    for (0..8) |i| {
+        try b.makeStrMove(cycle[i % 4]);
+        hashes[i + 1] = b.zobrist_hasher.zobrist_hash;
+    }
+    engine.setGameHistory(hashes[0..5]);
+    try std.testing.expectEqual(@as(usize, 4), engine.game_history_count);
+    engine.position_history[0] = b.zobrist_hasher.zobrist_hash;
+    engine.history_count = 1;
+    try std.testing.expect(!engine.isRepetition());
+    engine.setGameHistory(&hashes);
+    try std.testing.expect(engine.isRepetition());
+    try std.testing.expectEqual(DRAW_SCORE, try engine.quiescence(-INF, INF, 1));
+    engine.game_history_count = 0;
+    @memcpy(engine.position_history[0..5], hashes[0..5]);
+    engine.history_count = 5;
+    try std.testing.expect(engine.isRepetition());
+    engine.repetition_floor = 1;
+    try std.testing.expect(!engine.isRepetition());
 }

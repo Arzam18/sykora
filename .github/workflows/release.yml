@@ -22,8 +22,8 @@ jobs:
             cpu: x86_64_v3
             artifact: sykora-linux-x86_64-avx2
           - os: ubuntu-latest
-            target: aarch64-linux
-            cpu: baseline
+            target: aarch64-linux-musl
+            cpu: baseline+neon
             pie: true
             artifact: sykora-linux-aarch64
           # Zig 0.15.2 cannot link its build runner on the macOS 26 image.
@@ -61,6 +61,22 @@ jobs:
       - name: Build
         run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} -Dcpu=${{ matrix.cpu }} ${{ matrix.pie && '-Dpie' || '' }}
 
+      - name: Verify static AArch64 PIE
+        if: matrix.target == 'aarch64-linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          readelf -h zig-out/bin/sykora | grep -Eq 'Type:.*DYN'
+          readelf -h zig-out/bin/sykora | grep -Eq 'Machine:.*AArch64'
+          if readelf -l zig-out/bin/sykora | grep -q INTERP; then
+            echo 'AArch64 binary unexpectedly requires a dynamic loader' >&2
+            exit 1
+          fi
+          if readelf -d zig-out/bin/sykora | grep -q NEEDED; then
+            echo 'AArch64 binary unexpectedly requires a shared library' >&2
+            exit 1
+          fi
+
       - name: Rename binary (Unix)
         if: runner.os != 'Windows'
         run: cp zig-out/bin/sykora ${{ matrix.artifact }}
@@ -88,8 +104,7 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          # The release SPRT runs in parallel on the tag. Keep artifacts private
-          # until its result has been reviewed and the draft is published.
+          # Keep release artifacts in a draft for review before publishing.
           draft: true
           generate_release_notes: true
           files: artifacts/**/*
