@@ -15,6 +15,7 @@ pub const SearchTuning = struct {
     lmr_counter: i32 = 1024,
     lmr_improving: i32 = 1024,
     lmr_pv: i32 = 1024,
+    lmr_cut_node: i32 = 1024,
 
     // Late move pruning.
     lmp_move_scale_pct: i32 = 90,
@@ -22,12 +23,15 @@ pub const SearchTuning = struct {
     lmp_improving_bonus: u32 = 2,
 
     // History.
-    history_bonus_scale_pct: i32 = 100,
-    history_max_bonus: u32 = 490,
+    history_bonus_mult: i32 = 160,
+    history_bonus_offset: i32 = 96,
+    history_max_bonus: u32 = 1600,
 
     // Static-eval correction history weights (pawn, per-side non-pawn).
     corr_pawn_weight: i32 = 200,
     corr_non_pawn_weight: i32 = 100,
+    corr_minor_weight: i32 = 100,
+    corr_major_weight: i32 = 100,
 
     // Aspiration windows.
     asp_delta: i32 = 25,
@@ -51,6 +55,7 @@ pub const SearchTuning = struct {
     nmp_base_reduction: u32 = 3,
     nmp_eval_margin: i32 = 80,
     nmp_eval_reduce_margin: i32 = 200,
+    nmp_depth_divisor: u32 = 3,
 
     // ProbCut.
     probcut_min_depth: u32 = 6,
@@ -130,14 +135,18 @@ pub const tunables = [_]Tunable{
     .{ .name = "LMRCounter", .field = "lmr_counter", .min = 0, .max = 2048 },
     .{ .name = "LMRImproving", .field = "lmr_improving", .min = 0, .max = 2048 },
     .{ .name = "LMRPV", .field = "lmr_pv", .min = 0, .max = 2048 },
+    .{ .name = "LMRCutNode", .field = "lmr_cut_node", .min = 0, .max = 3072 },
     .{ .name = "LMRMinDepth", .field = "lmr_min_depth", .min = 1, .max = 6, .group = .discrete },
     .{ .name = "LMPMoveScale", .field = "lmp_move_scale_pct", .min = 50, .max = 200 },
     .{ .name = "LMPMaxDepth", .field = "lmp_max_depth", .min = 0, .max = 3, .group = .discrete },
     .{ .name = "LMPImprovingBonus", .field = "lmp_improving_bonus", .min = 0, .max = 8, .group = .discrete },
-    .{ .name = "HistoryBonusScale", .field = "history_bonus_scale_pct", .min = 30, .max = 300 },
-    .{ .name = "HistoryMaxBonus", .field = "history_max_bonus", .min = 50, .max = 1600 },
+    .{ .name = "HistoryBonusMult", .field = "history_bonus_mult", .min = 40, .max = 400 },
+    .{ .name = "HistoryBonusOffset", .field = "history_bonus_offset", .min = 0, .max = 400 },
+    .{ .name = "HistoryMaxBonus", .field = "history_max_bonus", .min = 400, .max = 4000 },
     .{ .name = "CorrPawnWeight", .field = "corr_pawn_weight", .min = 0, .max = 400 },
     .{ .name = "CorrNonPawnWeight", .field = "corr_non_pawn_weight", .min = 0, .max = 300 },
+    .{ .name = "CorrMinorWeight", .field = "corr_minor_weight", .min = 0, .max = 300 },
+    .{ .name = "CorrMajorWeight", .field = "corr_major_weight", .min = 0, .max = 300 },
     .{ .name = "AspDelta", .field = "asp_delta", .min = 8, .max = 60 },
     .{ .name = "AspWidenPct", .field = "asp_widen_pct", .min = 130, .max = 300 },
     .{ .name = "RFPMargin", .field = "rfp_margin", .min = 40, .max = 200 },
@@ -152,6 +161,7 @@ pub const tunables = [_]Tunable{
     .{ .name = "NMPBaseReduction", .field = "nmp_base_reduction", .min = 1, .max = 6, .group = .discrete },
     .{ .name = "NMPEvalMargin", .field = "nmp_eval_margin", .min = 0, .max = 200 },
     .{ .name = "NMPEvalReduceMargin", .field = "nmp_eval_reduce_margin", .min = 50, .max = 400 },
+    .{ .name = "NMPDepthDivisor", .field = "nmp_depth_divisor", .min = 2, .max = 8, .group = .discrete },
     .{ .name = "ProbCutMinDepth", .field = "probcut_min_depth", .min = 3, .max = 10, .group = .discrete },
     .{ .name = "ProbCutMargin", .field = "probcut_margin", .min = 80, .max = 350 },
     .{ .name = "SingularMinDepth", .field = "singular_min_depth", .min = 4, .max = 12, .group = .discrete },

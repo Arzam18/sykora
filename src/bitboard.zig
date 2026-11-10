@@ -688,6 +688,11 @@ pub const Board = struct {
         legal_movegen.generateLegalMovesFast(self.board, moves, &ctx, .captures);
     }
 
+    pub fn hasLegalQuietMove(self: *Self) bool {
+        const ctx = legal_context_mod.computeLegalContext(self.board);
+        return legal_movegen.hasLegalQuietMove(self.board, &ctx);
+    }
+
     pub fn generateLegalQuietMoves(self: *Self, moves: *MoveList) void {
         const ctx = legal_context_mod.computeLegalContext(self.board);
         legal_movegen.generateLegalMovesFast(self.board, moves, &ctx, .quiets);
@@ -950,6 +955,29 @@ pub const BitBoard = struct {
         }
 
         return result;
+    }
+
+    /// Every square a piece of `color` attacks.
+    pub fn attackedBy(self: *const Self, color: pieceInfo.Color) u64 {
+        const occupied_squares = self.occupied();
+        const own = self.getColorBitboard(color);
+        const pawns = own & self.getKindBitboard(.pawn);
+        const not_a: u64 = 0xFEFEFEFEFEFEFEFE;
+        const not_h: u64 = 0x7F7F7F7F7F7F7F7F;
+        var attacked = if (color == .white)
+            ((pawns << 7) & not_h) | ((pawns << 9) & not_a)
+        else
+            ((pawns >> 9) & not_h) | ((pawns >> 7) & not_a);
+        var knights = own & self.getKindBitboard(.knight);
+        while (knights != 0) : (knights &= knights - 1) attacked |= getKnightAttacks(@intCast(@ctz(knights)));
+        const queens = self.getKindBitboard(.queen);
+        var diagonal = own & (self.getKindBitboard(.bishop) | queens);
+        while (diagonal != 0) : (diagonal &= diagonal - 1) attacked |= getBishopAttacks(@intCast(@ctz(diagonal)), occupied_squares);
+        var orthogonal = own & (self.getKindBitboard(.rook) | queens);
+        while (orthogonal != 0) : (orthogonal &= orthogonal - 1) attacked |= getRookAttacks(@intCast(@ctz(orthogonal)), occupied_squares);
+        const king = own & self.getKindBitboard(.king);
+        if (king != 0) attacked |= getKingAttacks(@intCast(@ctz(king)));
+        return attacked;
     }
 
     pub inline fn whiteToMove(self: *const Self) bool {

@@ -68,57 +68,54 @@ pub const CounterMoveTable = struct {
     }
 };
 
+/// Butterfly history split by whether the move leaves and/or enters a square
+/// the opponent attacks, so escaping a threat and walking into one learn
+/// separate scores.
 pub const HistoryTable = struct {
-    scores: [2][64][64]i32,
+    scores: [2][4][64][64]i32,
+
+    inline fn threatBucket(move: Move, threats: u64) usize {
+        const from_threatened: usize = @intCast((threats >> @intCast(move.from())) & 1);
+        const to_threatened: usize = @intCast((threats >> @intCast(move.to())) & 1);
+        return from_threatened * 2 + to_threatened;
+    }
 
     // Keep runtime-selected cells in lvalue context. Reading through chained
     // value indexing makes Zig 0.15 materialize the entire 16 KiB color row.
 
     pub fn init() HistoryTable {
         return HistoryTable{
-            .scores = [_][64][64]i32{[_][64]i32{[_]i32{0} ** 64} ** 64} ** 2,
+            .scores = [_][4][64][64]i32{[_][64][64]i32{[_][64]i32{[_]i32{0} ** 64} ** 64} ** 4} ** 2,
         };
     }
 
-    pub fn update(self: *HistoryTable, move: Move, bonus: i32, color: piece.Color) void {
+    pub fn update(self: *HistoryTable, move: Move, bonus: i32, color: piece.Color, threats: u64) void {
         const c: usize = @intFromEnum(color);
-        const entry = &self.scores[c][move.from()][move.to()];
+        const entry = &self.scores[c][threatBucket(move, threats)][move.from()][move.to()];
         const current = entry.*;
         entry.* = historyGravity(current, bonus);
     }
 
-    pub fn penalize(self: *HistoryTable, move: Move, penalty: i32, color: piece.Color) void {
+    pub fn penalize(self: *HistoryTable, move: Move, penalty: i32, color: piece.Color, threats: u64) void {
         const c: usize = @intFromEnum(color);
-        const entry = &self.scores[c][move.from()][move.to()];
+        const entry = &self.scores[c][threatBucket(move, threats)][move.from()][move.to()];
         const current = entry.*;
         entry.* = historyGravity(current, -penalty);
     }
 
-    pub fn get(self: *const HistoryTable, move: Move) i32 {
-        const white_entry = &self.scores[0][move.from()][move.to()];
-        const black_entry = &self.scores[1][move.from()][move.to()];
-        return white_entry.* + black_entry.*;
-    }
-
-    pub fn getForColor(self: *const HistoryTable, move: Move, color: piece.Color) i32 {
+    pub fn getForColor(self: *const HistoryTable, move: Move, color: piece.Color, threats: u64) i32 {
         const c: usize = @intFromEnum(color);
-        const entry = &self.scores[c][move.from()][move.to()];
+        const entry = &self.scores[c][threatBucket(move, threats)][move.from()][move.to()];
         return entry.*;
     }
 
     pub fn clear(self: *HistoryTable) void {
-        self.scores = [_][64][64]i32{[_][64]i32{[_]i32{0} ** 64} ** 64} ** 2;
+        @memset(std.mem.asBytes(&self.scores), 0);
     }
 
     pub fn age(self: *HistoryTable) void {
-        for (0..2) |c| {
-            for (0..64) |from| {
-                for (0..64) |to| {
-                    const entry = &self.scores[c][from][to];
-                    entry.* = @divTrunc(entry.*, 2);
-                }
-            }
-        }
+        const cells: *[2 * 4 * 64 * 64]i32 = @ptrCast(&self.scores);
+        for (cells) |*cell| cell.* = @divTrunc(cell.*, 2);
     }
 };
 
@@ -208,10 +205,13 @@ const CORRECTION_WEIGHT_SCALE = 256;
 const CORRECTION_MAX = 64 * CORRECTION_GRAIN;
 
 /// Learns the residual between searched scores and static eval, keyed by pawn
-/// structure and by each side's non-pawn placement.
+/// structure, by each side's non-pawn placement, and by the minor-piece and
+/// major-piece configurations of both sides.
 pub const CorrectionHistory = struct {
     pawn: [2][CORRECTION_SIZE]i16,
     non_pawn: [2][2][CORRECTION_SIZE]i16,
+    minor: [2][CORRECTION_SIZE]i16,
+    major: [2][CORRECTION_SIZE]i16,
 
     pub fn initInPlace(self: *CorrectionHistory) void {
         @memset(std.mem.asBytes(self), 0);
@@ -220,6 +220,15 @@ pub const CorrectionHistory = struct {
     pub const Keys = struct {
         pawn: u64,
         non_pawn: [2]u64,
+        minor: u64,
+        major: u64,
+    };
+
+    pub const Weights = struct {
+        pawn: i32,
+        non_pawn: i32,
+        minor: i32,
+        major: i32,
     };
 
     pub fn keys(b: anytype) Keys {
@@ -227,12 +236,16 @@ pub const CorrectionHistory = struct {
         const white = b.getColorBitboard(.white);
         const black = b.getColorBitboard(.black);
         const non_pawn = ~pawns;
+        const minors = b.getKindBitboard(.knight) | b.getKindBitboard(.bishop);
+        const majors = b.getKindBitboard(.rook) | b.getKindBitboard(.queen);
         return .{
             .pawn = mix(pawns & white) ^ mix((pawns & black) ^ 0x9E3779B97F4A7C15),
             .non_pawn = .{
                 pieceSetKey(b, white & non_pawn),
                 pieceSetKey(b, black & non_pawn),
             },
+            .minor = mix(minors & white) ^ mix((minors & black) ^ 0x3C6EF372FE94F82A),
+            .major = mix(majors & white) ^ mix((majors & black) ^ 0xA54FF53A5F1D36F1),
         };
     }
 
@@ -260,16 +273,22 @@ pub const CorrectionHistory = struct {
         @prefetch(&self.pawn[c][index(k.pawn)], .{});
         @prefetch(&self.non_pawn[c][0][index(k.non_pawn[0])], .{});
         @prefetch(&self.non_pawn[c][1][index(k.non_pawn[1])], .{});
+        @prefetch(&self.minor[c][index(k.minor)], .{});
+        @prefetch(&self.major[c][index(k.major)], .{});
     }
 
-    /// Weights are percentages; the defaults 200/100 count pawn structure twice.
-    pub fn correction(self: *const CorrectionHistory, stm: piece.Color, k: Keys, pawn_weight: i32, non_pawn_weight: i32) i32 {
+    /// Weights are percentages; the defaults count pawn structure twice.
+    pub fn correction(self: *const CorrectionHistory, stm: piece.Color, k: Keys, w: Weights) i32 {
         const c = @intFromEnum(stm);
         const pawn_entry = &self.pawn[c][index(k.pawn)];
         const white_entry = &self.non_pawn[c][0][index(k.non_pawn[0])];
         const black_entry = &self.non_pawn[c][1][index(k.non_pawn[1])];
-        const sum = pawn_weight * @as(i32, pawn_entry.*) +
-            non_pawn_weight * (@as(i32, white_entry.*) + @as(i32, black_entry.*));
+        const minor_entry = &self.minor[c][index(k.minor)];
+        const major_entry = &self.major[c][index(k.major)];
+        const sum = w.pawn * @as(i32, pawn_entry.*) +
+            w.non_pawn * (@as(i32, white_entry.*) + @as(i32, black_entry.*)) +
+            w.minor * @as(i32, minor_entry.*) +
+            w.major * @as(i32, major_entry.*);
         return @divTrunc(sum, 200 * CORRECTION_GRAIN);
     }
 
@@ -280,6 +299,8 @@ pub const CorrectionHistory = struct {
         updateCell(&self.pawn[c][index(k.pawn)], scaled, weight);
         updateCell(&self.non_pawn[c][0][index(k.non_pawn[0])], scaled, weight);
         updateCell(&self.non_pawn[c][1][index(k.non_pawn[1])], scaled, weight);
+        updateCell(&self.minor[c][index(k.minor)], scaled, weight);
+        updateCell(&self.major[c][index(k.major)], scaled, weight);
     }
 
     fn updateCell(cell: *i16, scaled: i32, weight: i32) void {
@@ -298,15 +319,15 @@ fn historyGravity(current: i32, bonus: i32) i32 {
 test "contradictory evidence moves saturated quiet and continuation history" {
     const m = Move.init(12, 28, null);
     var history = HistoryTable.init();
-    history.scores[0][12][28] = 16000;
-    history.penalize(m, 100, .white);
-    try std.testing.expectEqual(@as(i32, 15803), history.getForColor(m, .white));
-    history.scores[0][12][28] = -16384;
-    history.update(m, 100, .white);
-    try std.testing.expectEqual(@as(i32, -16184), history.getForColor(m, .white));
-    history.scores[0][12][28] = 16384;
-    history.penalize(m, 100, .white);
-    try std.testing.expectEqual(@as(i32, 16184), history.getForColor(m, .white));
+    history.scores[0][0][12][28] = 16000;
+    history.penalize(m, 100, .white, 0);
+    try std.testing.expectEqual(@as(i32, 15803), history.getForColor(m, .white, 0));
+    history.scores[0][0][12][28] = -16384;
+    history.update(m, 100, .white, 0);
+    try std.testing.expectEqual(@as(i32, -16184), history.getForColor(m, .white, 0));
+    history.scores[0][0][12][28] = 16384;
+    history.penalize(m, 100, .white, 0);
+    try std.testing.expectEqual(@as(i32, 16184), history.getForColor(m, .white, 0));
     var cell: i16 = 16384;
     ContinuationHistoryTable.penalizeCell(&cell, 100);
     try std.testing.expectEqual(@as(i16, 16184), cell);
